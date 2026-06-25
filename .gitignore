@@ -1,0 +1,17 @@
+# Build output
+/dist/
+/claude-janitor
+*.exe
+
+# Go
+*.test
+*.out
+vendor/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Local logs
+*.log

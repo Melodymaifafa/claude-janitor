@@ -4,9 +4,14 @@ Cross-platform CLI that reclaims memory by killing idle Claude Code session
 processes (default: idle > 2h). It does **not** delete session files — history
 is kept so you can resume the conversation later.
 
-Status: **design spike** (MEL-91). The architecture is locked in
-[`docs/design.md`](docs/design.md); implementation follows in MEL-90's three
-downstream slices (kill logic / scheduler install / packaging).
+Status: kill-logic slice (MEL-92) **implemented**. The architecture is locked in
+[`docs/design.md`](docs/design.md). Remaining MEL-90 slices: scheduler install
+(MEL-93) and packaging.
+
+```
+go build -o claude-janitor .
+./claude-janitor --dry-run    # see what would be killed, kill nothing
+```
 
 ## What it does
 

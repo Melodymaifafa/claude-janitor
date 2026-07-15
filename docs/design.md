@@ -177,6 +177,34 @@ verifications for the slice that implements B-class on each OS.
 
 ---
 
+## CLI contract (MEL-92 — for MEL-93 scheduler alignment)
+
+The kill-logic slice owns the CLI root and the scan-and-kill command. The
+MEL-93 scheduler slice invokes this command on its timer.
+
+- **Default command == `run`**: `claude-janitor` and `claude-janitor run` both
+  perform exactly ONE scan-and-kill pass over A-class + B-class, then exit.
+- The scheduler should call `claude-janitor run` (idempotent single pass).
+- `install` / `uninstall` (the OS scheduled job) are **MEL-93's** to add at the
+  same CLI root; they are not implemented in this slice.
+
+Flags (all optional):
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--dry-run` | off | print "would kill X", do not kill |
+| `--idle-min N` | 120 | idle threshold in minutes |
+| `--interval-min N` | 30 | scan interval in minutes — recorded only; the scheduler consumes it |
+| `--projects-dir PATH` | `~/.claude/projects` | override A-class transcript root |
+| `--sessions-dir PATH` | per-OS (§2.B) | override B-class desktop session root |
+
+Code layout: `main.go` (CLI root) + `internal/janitor/` (one gopsutil codepath
+for steps 1–3, behind clean functions; per-OS bits isolated in build-tagged
+`paths_*.go` / `ftime_*.go`). MEL-93 adds an `installer` interface + three
+per-OS implementations at the same root; expect a minor merge at `main.go`.
+
+---
+
 ## Sources
 
 - Claude Code `.claude` directory layout: https://code.claude.com/docs/en/claude-directory

@@ -1,0 +1,74 @@
+package janitor
+
+import (
+	"github.com/shirou/gopsutil/v3/process"
+)
+
+// killProcessTree kills the process tree rooted at pid (children first, then the
+// process), then also kills the disclaimer wrapper parent, matching the Mac
+// reference's kill_session. gopsutil Kill() sends SIGKILL on POSIX and calls
+// TerminateProcess on Windows -- both are the non-ignorable kill the
+// SIGTERM-ignoring background processes require (design.md §5).
+//
+// Returns the pids it killed (or would kill, when dryRun). It never errors out
+// the whole pass for a single failed kill -- a process may have already exited.
+func killProcessTree(pid int32, dryRun bool) []int32 {
+	p, err := process.NewProcess(pid)
+	if err != nil {
+		return nil
+	}
+
+	var killed []int32
+	parentPID := wrapperParent(p)
+
+	// Recurse into the tree, killing leaves before their parents.
+	killed = append(killed, killTreeRecursive(p, dryRun)...)
+
+	// Also kill the disclaimer wrapper parent (reference kill_session step 2):
+	// only when it is a real parent (pid > 1) and not the same process.
+	if parentPID > 1 && parentPID != pid {
+		if killOne(parentPID, dryRun) {
+			killed = append(killed, parentPID)
+		}
+	}
+	return killed
+}
+
+// wrapperParent returns the ppid of p, or -1 if unavailable.
+func wrapperParent(p *process.Process) int32 {
+	ppid, err := p.Ppid()
+	if err != nil {
+		return -1
+	}
+	return ppid
+}
+
+func killTreeRecursive(p *process.Process, dryRun bool) []int32 {
+	var killed []int32
+	if children, err := p.Children(); err == nil {
+		for _, c := range children {
+			killed = append(killed, killTreeRecursive(c, dryRun)...)
+		}
+	}
+	if killOne(p.Pid, dryRun) {
+		killed = append(killed, p.Pid)
+	}
+	return killed
+}
+
+// killOne kills a single pid (SIGKILL / TerminateProcess) unless dryRun.
+// Returns true if the kill was issued (or would be, in dry-run).
+func killOne(pid int32, dryRun bool) bool {
+	if dryRun {
+		return true
+	}
+	p, err := process.NewProcess(pid)
+	if err != nil {
+		return false
+	}
+	// gopsutil Kill() == SIGKILL on POSIX, TerminateProcess on Windows.
+	if err := p.Kill(); err != nil {
+		return false
+	}
+	return true
+}

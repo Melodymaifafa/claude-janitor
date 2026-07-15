@@ -1,0 +1,107 @@
+# goreleaser config for claude-janitor (schema v2).
+# Builds static Mac/Linux/Windows binaries and publishes archives + checksums
+# to a GitHub Release, then updates the Homebrew / Scoop / Winget manifests.
+#
+# Run locally without publishing:  goreleaser release --snapshot --clean
+# Real release (from GitHub Actions on a v* tag):  goreleaser release --clean
+#
+# The brews/scoops/winget blocks push to registry repos that must exist and need
+# tokens that only the repo owner (Melody) can provide -- see README "Publishing"
+# and the MEL-94 follow-up sub-issue. Archives + checksums work with no extra setup.
+version: 2
+
+project_name: claude-janitor
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: claude-janitor
+    main: .
+    binary: claude-janitor
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+# --- Homebrew (macOS): needs a tap repo maicuigua/homebrew-tap + a PAT in
+#     HOMEBREW_TAP_GITHUB_TOKEN. See README "Publishing". The post-install hook
+#     strips the Gatekeeper quarantine flag from the unsigned binary. ---
+homebrew_casks:
+  - name: claude-janitor
+    repository:
+      owner: maicuigua
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/maicuigua/claude-janitor
+    description: Reclaim memory by killing idle Claude Code session processes
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/claude-janitor"]
+          end
+
+# --- Scoop (Windows): needs a bucket repo maicuigua/scoop-bucket. ---
+scoops:
+  - repository:
+      owner: maicuigua
+      name: scoop-bucket
+      token: "{{ .Env.SCOOP_BUCKET_GITHUB_TOKEN }}"
+    homepage: https://github.com/maicuigua/claude-janitor
+    description: Reclaim memory by killing idle Claude Code session processes
+    license: MIT
+
+# --- Winget (Windows): opens a PR against microsoft/winget-pkgs via a fork. ---
+winget:
+  - name: claude-janitor
+    publisher: maicuigua
+    short_description: Reclaim memory by killing idle Claude Code session processes
+    license: MIT
+    homepage: https://github.com/maicuigua/claude-janitor
+    repository:
+      owner: maicuigua
+      name: winget-pkgs
+      branch: "claude-janitor-{{ .Version }}"
+      token: "{{ .Env.WINGET_GITHUB_TOKEN }}"
+      pull_request:
+        enabled: true
+        base:
+          owner: microsoft
+          name: winget-pkgs
+          branch: master
+
+release:
+  github:
+    owner: maicuigua
+    name: claude-janitor
+  draft: false
+  prerelease: auto

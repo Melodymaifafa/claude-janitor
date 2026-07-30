@@ -1,9 +1,21 @@
 // Package janitor implements the cross-platform scan-and-kill core of
-// claude-janitor: find idle/dead Claude Code session processes and kill their
-// process trees. It is a faithful Go port of the proven Mac reference
-// (~/.claude/scripts/claude-session-janitor.sh), using gopsutil so the same
-// codepath runs on macOS, Linux, and Windows (design.md §4). It never deletes
-// session files -- history is preserved for resume.
+// claude-janitor: find idle Claude Code session processes and kill their
+// process trees. It never deletes session files -- history is preserved for
+// resume.
+//
+// Idleness is always judged by the mtime of the session's transcript
+// (~/.claude/projects/*/<id>.jsonl), which every message updates. Terminal
+// sessions name their transcript via --resume <uuid>; desktop background
+// sessions carry no id in argv, so each process is paired to the transcript
+// born right after the process started (measured 4-14s on a real Mac).
+//
+// HISTORY -- do not reintroduce: an earlier design judged desktop sessions by
+// the desktop app's local_<uuid>.json mtime. That file is a UI-event snapshot,
+// rewritten whole on create/reopen and NEVER during task execution, so
+// "idle N min" really meant "born N min ago": sessions running long tasks were
+// killed mid-task at age 2h, and the stale json re-matched neighbor processes
+// on later passes (double-kills). The 2026-07-30 incident report lives in the
+// repo docs; the transcript is the only reliable activity signal.
 package janitor
 
 import (
@@ -12,7 +24,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 )
 
@@ -20,7 +31,7 @@ import (
 type Result struct {
 	Killed  int
 	Spared  int // active sessions left running
-	Skipped int // session processes with no resolvable/idle transcript
+	Skipped int // processes left alone: no transcript resolvable/pairable
 }
 
 // Janitor runs scan-and-kill passes.
@@ -30,19 +41,20 @@ type Janitor struct {
 	now func() time.Time
 }
 
-// New builds a Janitor, filling unset paths with per-OS defaults.
+// New builds a Janitor, filling unset knobs with defaults.
 func New(cfg Config, out io.Writer) *Janitor {
+	def := Defaults()
 	if cfg.IdleThreshold == 0 {
-		cfg.IdleThreshold = Defaults().IdleThreshold
+		cfg.IdleThreshold = def.IdleThreshold
 	}
-	if cfg.MatchTolerance == 0 {
-		cfg.MatchTolerance = Defaults().MatchTolerance
+	if cfg.PairBefore == 0 {
+		cfg.PairBefore = def.PairBefore
+	}
+	if cfg.PairAfter == 0 {
+		cfg.PairAfter = def.PairAfter
 	}
 	if cfg.ProjectsDir == "" {
 		cfg.ProjectsDir = defaultProjectsDir()
-	}
-	if cfg.SessionsDir == "" {
-		cfg.SessionsDir = defaultSessionsDir()
 	}
 	if out == nil {
 		out = os.Stdout
@@ -61,7 +73,7 @@ func (j *Janitor) Run() (Result, error) {
 		return res, fmt.Errorf("list processes: %w", err)
 	}
 
-	j.scanTerminal(procs, cutoff, &res)
+	j.scanTerminal(procs, now, cutoff, &res)
 	j.scanDesktop(procs, now, cutoff, &res)
 
 	suffix := ""
@@ -73,9 +85,9 @@ func (j *Janitor) Run() (Result, error) {
 	return res, nil
 }
 
-// scanTerminal handles A-class: processes with --resume <uuid>; idle judged by
-// the mtime of ~/.claude/projects/*/<uuid>.jsonl.
-func (j *Janitor) scanTerminal(procs []procInfo, cutoff time.Time, res *Result) {
+// scanTerminal handles A-class: processes with --resume <uuid>; the transcript
+// is named by the uuid directly.
+func (j *Janitor) scanTerminal(procs []procInfo, now, cutoff time.Time, res *Result) {
 	for _, p := range procs {
 		uuid := resumeUUID(p.cmdline)
 		if uuid == "" {
@@ -96,79 +108,123 @@ func (j *Janitor) scanTerminal(procs []procInfo, cutoff time.Time, res *Result) 
 			continue
 		}
 		killed := killProcessTree(p.pid, j.cfg.DryRun)
-		j.report("terminal", p.pid, uuid, j.now().Sub(ft.mtime), killed)
+		j.report("terminal", p.pid, uuid, now.Sub(ft.mtime), killed)
 		res.Killed++
 	}
 }
 
-// scanDesktop handles B-class: background sessions with --output-format
-// stream-json and no --resume. Idle judged by the mtime of the desktop app's
-// local_<uuid>.json; reverse-matched to a process by start time.
+// scanDesktop handles B-class: desktop background sessions (--output-format
+// stream-json, no --resume). Each process is paired to the transcript whose
+// birth time falls within [start-PairBefore, start+PairAfter]; one transcript
+// claims at most one process (smallest gap wins -- a re-opened session's
+// process would otherwise steal a neighbor's transcript). Unpaired processes
+// are NEVER killed: a re-opened session appends its old transcript, whose
+// birth predates the new process, so it cannot pair -- leaking one process
+// beats killing an active session.
 func (j *Janitor) scanDesktop(procs []procInfo, now, cutoff time.Time, res *Result) {
-	if j.cfg.SessionsDir == "" {
-		return
-	}
-	if _, err := os.Stat(j.cfg.SessionsDir); err != nil {
-		// Per design.md §2.B: log and skip rather than crash when the
-		// B-class root does not exist on this box.
-		j.logf("desktop sessions dir not found, skipping B-class: %s", j.cfg.SessionsDir)
-		return
-	}
+	trs, noBtime := j.listTranscripts()
 
-	// Candidate background-session processes (stream-json, no --resume).
-	candidates := make([]procInfo, 0, len(procs))
+	// Collect every (process, transcript) combination whose birth/start gap
+	// falls inside the pairing window, then greedily match globally by
+	// smallest gap with both sides exclusive. Sessions started seconds apart
+	// each still get their own transcript (per-process "closest wins" would
+	// let both pick the same one and orphan the other).
+	type cand struct {
+		p     procInfo
+		gap   time.Duration // |transcript birth - process start|
+		mtime time.Time
+		path  string
+	}
+	var bprocs []procInfo
+	var cands []cand
 	for _, p := range procs {
-		if resumeUUID(p.cmdline) != "" {
-			continue
+		if resumeUUID(p.cmdline) != "" || !hasStreamJSON(p.cmdline) {
+			continue // not a B-class desktop background session
 		}
-		if !hasStreamJSON(p.cmdline) {
-			continue
+		bprocs = append(bprocs, p)
+		for _, tr := range trs {
+			gap := tr.btime.Sub(p.createdAt)
+			if gap < -j.cfg.PairBefore || gap > j.cfg.PairAfter {
+				continue
+			}
+			if gap < 0 {
+				gap = -gap
+			}
+			cands = append(cands, cand{p: p, gap: gap, mtime: tr.mtime, path: tr.path})
 		}
-		candidates = append(candidates, p)
 	}
 
-	jsons := findSessionJSONs(j.cfg.SessionsDir)
-	used := make(map[int32]bool)
+	if len(bprocs) > 0 && len(trs) == 0 && noBtime > 0 {
+		// e.g. Linux filesystems without birth-time support: pairing is
+		// impossible, so B-class is deliberately inert rather than guessing.
+		j.logf("transcript birth times unavailable (%d files); desktop sessions left untouched", noBtime)
+	}
 
-	for _, jf := range jsons {
-		ft, err := statTimes(jf)
+	sort.Slice(cands, func(a, b int) bool { return cands[a].gap < cands[b].gap })
+	paired := make(map[int32]cand, len(bprocs))
+	claimed := make(map[string]bool, len(bprocs))
+	for _, c := range cands {
+		if _, ok := paired[c.p.pid]; ok {
+			continue
+		}
+		if claimed[c.path] {
+			continue
+		}
+		paired[c.p.pid] = c
+		claimed[c.path] = true
+	}
+
+	for _, p := range bprocs {
+		c, ok := paired[p.pid]
+		if !ok {
+			// A re-opened session appends its old transcript, whose birth
+			// predates the new process, so it cannot pair. Leaking one
+			// process beats killing an active session.
+			res.Skipped++
+			j.logf("skip (unpairable, never killed) PID=%d started=%s",
+				p.pid, p.createdAt.Format("01-02 15:04:05"))
+			continue
+		}
+		if c.mtime.After(cutoff) {
+			res.Spared++
+			continue
+		}
+		killed := killProcessTree(p.pid, j.cfg.DryRun)
+		j.report("desktop", p.pid,
+			fmt.Sprintf("%s pair-gap %ds", filepath.Base(c.path), int(c.gap.Seconds())),
+			now.Sub(c.mtime), killed)
+		res.Killed++
+	}
+}
+
+// transcriptInfo is one projects/*/*.jsonl candidate for B-class pairing.
+type transcriptInfo struct {
+	btime time.Time
+	mtime time.Time
+	path  string
+}
+
+// listTranscripts stats every transcript once. Files without a real birth time
+// (Linux fallback) are excluded from pairing -- their btime would equal mtime,
+// which for an append-forever transcript is "now", not creation -- and counted
+// in noBtime so the caller can log the degradation.
+func (j *Janitor) listTranscripts() (trs []transcriptInfo, noBtime int) {
+	matches, err := filepath.Glob(filepath.Join(j.cfg.ProjectsDir, "*", "*.jsonl"))
+	if err != nil {
+		return nil, 0
+	}
+	for _, m := range matches {
+		ft, err := statTimes(m)
 		if err != nil {
 			continue
 		}
-		if !ft.mtime.Before(cutoff) {
-			continue // mtime within threshold = active -> never touch
+		if !ft.hasBtime {
+			noBtime++
+			continue
 		}
-		uuid := sessionUUIDFromPath(jf)
-
-		// Find the process whose start time is closest before the json's
-		// creation time, within MatchTolerance. (reference B step 2)
-		best := int32(-1)
-		bestDiff := j.cfg.MatchTolerance + time.Second
-		for _, c := range candidates {
-			if used[c.pid] {
-				continue
-			}
-			// Process born clearly after the json -> not it (30s grace).
-			if c.createdAt.After(ft.btime.Add(30 * time.Second)) {
-				continue
-			}
-			diff := ft.btime.Sub(c.createdAt)
-			if diff < 0 {
-				diff = -diff
-			}
-			if diff <= j.cfg.MatchTolerance && diff < bestDiff {
-				best = c.pid
-				bestDiff = diff
-			}
-		}
-		if best < 0 {
-			continue // no live process for this idle json -> already gone
-		}
-		killed := killProcessTree(best, j.cfg.DryRun)
-		j.report("desktop", best, uuid, now.Sub(ft.mtime), killed)
-		used[best] = true // one process matches at most one json
-		res.Killed++
+		trs = append(trs, transcriptInfo{btime: ft.btime, mtime: ft.mtime, path: m})
 	}
+	return trs, noBtime
 }
 
 // findTranscript globs projects/*/<uuid>.jsonl and returns the first match.
@@ -183,38 +239,9 @@ func (j *Janitor) findTranscript(uuid string) string {
 	return matches[0]
 }
 
-// findSessionJSONs walks SessionsDir for local_*.json at any depth (the desktop
-// app nests by two UUID levels on Mac; other OSes may differ).
-func findSessionJSONs(root string) []string {
-	var out []string
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil // skip unreadable subtrees, keep walking
-		}
-		if d.IsDir() {
-			return nil
-		}
-		name := d.Name()
-		if strings.HasPrefix(name, "local_") && strings.HasSuffix(name, ".json") {
-			out = append(out, path)
-		}
-		return nil
-	})
-	sort.Strings(out)
-	return out
-}
-
-// sessionUUIDFromPath extracts the uuid from .../local_<uuid>.json.
-func sessionUUIDFromPath(path string) string {
-	base := filepath.Base(path)
-	base = strings.TrimSuffix(base, ".json")
-	return strings.TrimPrefix(base, "local_")
-}
-
-func (j *Janitor) report(class string, pid int32, uuid string, idle time.Duration, killed []int32) {
-	short := uuid
-	if len(short) > 8 {
-		short = short[:8]
+func (j *Janitor) report(class string, pid int32, ref string, idle time.Duration, killed []int32) {
+	if len(ref) > 30 {
+		ref = ref[:30]
 	}
 	idleMin := int(idle.Minutes())
 	verb := "killed"
@@ -225,7 +252,7 @@ func (j *Janitor) report(class string, pid int32, uuid string, idle time.Duratio
 	if len(killed) > 1 {
 		extra = fmt.Sprintf(" (tree+parent: %v)", killed)
 	}
-	j.logf("%s (%s) PID=%d uuid=%s (idle %d min)%s", verb, class, pid, short, idleMin, extra)
+	j.logf("%s (%s) PID=%d %s (idle %d min)%s", verb, class, pid, ref, idleMin, extra)
 }
 
 func (j *Janitor) logf(format string, args ...any) {

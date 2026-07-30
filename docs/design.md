@@ -18,18 +18,25 @@ Source: `~/.claude/scripts/claude-session-janitor.sh` (zsh) +
 `~/Library/LaunchAgents/com.maicuigua.claude-janitor.plist` (launchd, every
 1800s + RunAtLoad). The Go port must reproduce this logic exactly:
 
-- **A — terminal sessions**: list processes whose command line contains
-  `--resume <uuid>`; find `~/.claude/projects/*/<uuid>.jsonl`; if its mtime is
-  older than `IDLE_MIN` (120) → kill the process **and its wrapper parent**.
-- **B — desktop-app background sessions**: these run with
-  `--output-format stream-json` and **no** `--resume`, so the command line has
-  no uuid. Instead, iterate the desktop app's `local_<uuid>.json` files; for any
-  whose mtime is older than `IDLE_MIN`, reverse-match it to a running process
-  whose **start time** is within `MATCH_TOL` (240s) **before** the json's
-  birth/creation time, and kill that. Active sessions have fresh mtime, so they
-  never enter this loop → no false kills.
+- **A — sessions with an id in argv**: command line carries `--resume <uuid>`
+  (space or `=` form); find `~/.claude/projects/*/<uuid>.jsonl`; if its mtime is
+  older than `IDLE_MIN` (120) → kill the process tree and its disclaimer
+  wrapper parent (a non-disclaimer parent is never touched — for terminal
+  sessions it is the user's shell).
+- **B — desktop-app background sessions**: `--output-format stream-json`, no
+  `--resume`, no uuid in argv. Pair each process to the transcript **born**
+  4–14 s after the process start (window `[start−15 s, start+120 s]`, global
+  greedy match, both sides exclusive); judge idleness by that transcript's
+  mtime. Unpairable processes are never killed.
 - Both classes use **SIGKILL (-9)**, not SIGTERM — the background processes
   ignore TERM.
+- **Superseded (2026-07-30, do not reintroduce):** B-class originally judged
+  idleness by the desktop app's `local_<uuid>.json` mtime. That file is a
+  UI-event snapshot rewritten whole on create/reopen and never during task
+  execution, so "idle N min" really meant "born N min ago": sessions running
+  long tasks were killed mid-task at age 2 h, and the stale json re-matched
+  neighbor processes on later passes (observed double-kills). The transcript
+  is the only reliable activity signal.
 
 ---
 
@@ -76,26 +83,30 @@ it only globs `projects/*/<uuid>.jsonl` and reads mtime. **Same logic all 3 OSes
 `--resume <uuid>`, extract the uuid, look up that `<uuid>.jsonl`. Cross-platform
 via `gopsutil` `process.CmdlineSlice()`.
 
-### B. Desktop-app background sessions — the per-session JSON
+### B. Desktop-app background sessions — transcript pairing by birth time
 
-This is the **only genuinely OS-divergent path** and the main residual risk.
+B-class sessions write the **same** `projects/*/<id>.jsonl` transcripts as
+A-class (VERIFIED on Mac: the desktop app's `local_*.json` field
+`cliSessionId` names the transcript, which appears 4–14 s after the session
+process starts and is appended on every message). So B-class needs **no
+OS-divergent path at all** — only a way to map process → transcript:
 
-| OS | Path | Confidence |
-|----|------|-----------|
-| macOS | `~/Library/Application Support/Claude/claude-code-sessions/<a>/<b>/local_<uuid>.json` | **VERIFIED** — 395 files present; two-level UUID nesting confirmed |
-| Linux | `~/.config/Claude/claude-code-sessions/**/local_<uuid>.json` | **BEST KNOWN — confirm on target OS** — Claude desktop on Linux uses `~/.config/Claude/`; the `claude-code-sessions` subtree is assumed identical to Mac |
-| Windows native (MSIX) | `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude-code-sessions\**\local_<uuid>.json` | **BEST KNOWN — confirm on target OS** — MSIX virtualizes `%APPDATA%\Claude` into this package-local path; the visible `%APPDATA%\Claude` may be a redirected view |
+**Process identification (B):** processes with `--output-format stream-json`
+and no `--resume`. Pair each process to the transcript whose **birth time**
+falls in `[CreateTime−PairBefore, CreateTime+PairAfter]` (defaults 15 s /
+120 s; measured creation lag 4–14 s). Matching is global-greedy by smallest
+gap with both sides exclusive, so sessions started seconds apart each keep
+their own transcript. A process with no pairable transcript (e.g. a re-opened
+session appending its old transcript, whose birth predates the new process) is
+**never killed** — leaking one process beats killing an active session.
 
-Implementation rule: make the B-class root a **per-OS lookup with an override
-flag** (`--sessions-dir`), and at startup verify the dir exists; if not, log and
-skip B-class cleanup rather than crash. The implementer confirms the Linux/Windows
-roots by `ls` on a real box before trusting them.
+Where the filesystem exposes no real birth time (some Linux setups: btime
+needs statx and ext4/xfs), B-class pairing is deliberately inert — the pass
+logs the degradation and touches nothing. A-class is unaffected.
 
-**Process identification (B):** processes with `--output-format stream-json` and
-no `--resume`. Reverse-match idle `local_<uuid>.json` (mtime > threshold) to the
-running process whose `CreateTime()` falls within `MATCH_TOL` before the json's
-creation time. `gopsutil` `CreateTime()` gives the process start time on all 3 OSes
-(RESEARCHED) — this replaces the Mac-only `ps -axo lstart` + `date -j` parsing.
+**Superseded:** the earlier design reverse-matched the desktop app's
+`local_<uuid>.json` (per-OS paths, `--sessions-dir` override) to processes by
+start time. Killed active sessions mid-task — see §0. Do not reintroduce.
 
 ---
 
@@ -115,9 +126,10 @@ Why native, not WSL-only:
   inside that WSL distro and uses the Linux scheduler (systemd/cron). No special
   case, no extra slice.
 
-Residual unknown carried into implementation: the native-Windows **B-class
-desktop path** (MSIX virtualization, §2). The native CLI `--resume` path (A) is
-high-confidence; B needs on-box confirmation.
+Residual unknown carried into implementation: none path-related — B-class now
+pairs against the same `~/.claude/projects` transcripts as A-class (§2.B), so
+the MSIX desktop-path question is moot. Windows birth-time support for pairing
+is native; only exotic filesystems degrade B-class to inert.
 
 ---
 
@@ -125,8 +137,8 @@ high-confidence; B needs on-box confirmation.
 
 | Step | macOS | Linux | Windows native |
 |------|-------|-------|----------------|
-| **1. Find dead sessions** | glob `~/.claude/projects/*/<uuid>.jsonl` + desktop `local_*.json`; idle = mtime older than threshold | same, `~/.claude/...` + `~/.config/Claude/...` | same, `%USERPROFILE%\.claude\...` + MSIX desktop path | 
-| **2. Map session → process** | `gopsutil` `process.Processes()`, filter on `CmdlineSlice()` (`--resume`/`stream-json`); B-class reverse-match via `CreateTime()` | same | same |
+| **1. Find dead sessions** | glob `~/.claude/projects/*/*.jsonl`; idle = transcript mtime older than threshold | same, `~/.claude/...` | same, `%USERPROFILE%\.claude\...` | 
+| **2. Map session → process** | `gopsutil` `process.Processes()`, filter on `CmdlineSlice()` (`--resume`/`stream-json`); B-class paired by transcript birth vs `CreateTime()` | same | same |
 | **3. Kill process tree** | `gopsutil` `proc.Children()` recursively, then `proc.Kill()` (= SIGKILL); also kill the disclaimer wrapper parent | same (POSIX SIGKILL) | `proc.Kill()` → `TerminateProcess` under the hood; walk `Children()` for the tree | 
 | **4. Install/uninstall scheduled job** | write+`launchctl load` a LaunchAgent plist | write a **systemd user timer** (`.service`+`.timer`, `systemctl --user enable --now`); **fallback to crontab** when systemd absent | `schtasks /Create` (trigger: ONLOGON + every-30-min) / `schtasks /Delete` |
 
@@ -146,31 +158,31 @@ Notes:
 
 ## 5. Idle-detection logic (cross-platform equivalents)
 
-Logic is unchanged from the Mac script; only the syscalls differ:
-
-- **Idle = jsonl/json mtime older than `IDLE_MIN` (120 min).** mtime is read via
+- **Idle = transcript mtime older than `IDLE_MIN` (120 min).** mtime is read via
   Go `os.Stat()` → `FileInfo.ModTime()` on all 3 OSes (replaces Mac `stat -f '%m'`
-  / `find -mmin`). **VERIFIED** the Mac files carry usable mtime.
-- **B-class needs file *creation* time** (birthtime) for the reverse-match. macOS
-  exposes birthtime (`stat -f '%B'`, **VERIFIED**); Windows exposes it natively;
+  / `find -mmin`). **VERIFIED** the Mac files carry usable mtime, updated on
+  every message.
+- **B-class needs the transcript's *creation* time** (birthtime) as the pairing
+  anchor. macOS exposes birthtime (**VERIFIED**); Windows exposes it natively;
   Linux exposes it via `statx` on ext4/xfs but **not universally**. **Decision:**
-  where birthtime is missing/zero, fall back to mtime as the match anchor — for an
-  *idle* json (written once at creation), mtime ≈ creation time, so the fallback is
-  safe. **BEST KNOWN — confirm on target OS** for the Linux birthtime path.
+  where birthtime is missing, the transcript is excluded from pairing and
+  B-class goes inert with a log line — a mtime fallback is NOT safe here,
+  because an append-forever transcript's mtime is "now", not creation time.
 - **SIGTERM-ignoring background processes → SIGKILL.** `gopsutil` `Kill()` sends
   SIGKILL on POSIX and calls `TerminateProcess` (unconditional, no catchable
   signal) on Windows — both are the non-ignorable kill, matching the Mac `-9`
   behavior (RESEARCHED).
-- `MATCH_TOL` (240s) and the "process must not be born after the json" guard
-  carry over unchanged.
+- Pairing window `PairBefore`/`PairAfter` = 15 s / 120 s (measured transcript
+  creation lag on-box: 4–14 s; the window leaves ~10× headroom without
+  swallowing a neighbor session started minutes apart).
 
 ---
 
 ## Open items for implementation (not blockers)
 
-1. Confirm Linux `~/.config/Claude/claude-code-sessions/` layout on a real Linux box.
-2. Confirm Windows native MSIX desktop session path (`Claude_pzs8sxrjxfjjc` package id may change by version).
-3. Confirm Linux birthtime availability per filesystem; mtime fallback covers the gap.
+1. Confirm Linux birthtime availability per filesystem (statx on ext4/xfs);
+   until then B-class is inert on such boxes and A-class carries the load.
+2. Consider a statx-based `ftime_linux.go` so Linux desktops get B-class pairing.
 
 None block the language/path/Windows decisions above — they are on-box
 verifications for the slice that implements B-class on each OS.
@@ -195,8 +207,7 @@ Flags (all optional):
 | `--dry-run` | off | print "would kill X", do not kill |
 | `--idle-min N` | 120 | idle threshold in minutes |
 | `--interval-min N` | 30 | scan interval in minutes — recorded only; the scheduler consumes it |
-| `--projects-dir PATH` | `~/.claude/projects` | override A-class transcript root |
-| `--sessions-dir PATH` | per-OS (§2.B) | override B-class desktop session root |
+| `--projects-dir PATH` | `~/.claude/projects` | override the transcript root (both classes) |
 
 Code layout: `main.go` (CLI root) + `internal/janitor/` (one gopsutil codepath
 for steps 1–3, behind clean functions; per-OS bits isolated in build-tagged

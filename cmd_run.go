@@ -23,8 +23,7 @@ func cmdRun(args []string) int {
 	dryRun := fs.Bool("dry-run", false, "print what would be killed, do not kill")
 	idleMin := fs.Int("idle-min", 120, "idle threshold in minutes")
 	intervalMin := fs.Int("interval-min", 30, "scan interval in minutes (used by the scheduler)")
-	projectsDir := fs.String("projects-dir", "", "override A-class transcript root")
-	sessionsDir := fs.String("sessions-dir", "", "override B-class desktop session root")
+	projectsDir := fs.String("projects-dir", "", "override transcript root (~/.claude/projects)")
 
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -34,12 +33,10 @@ func cmdRun(args []string) int {
 	}
 
 	cfg := janitor.Config{
-		IdleThreshold:  time.Duration(*idleMin) * time.Minute,
-		ScanInterval:   time.Duration(*intervalMin) * time.Minute,
-		MatchTolerance: janitor.Defaults().MatchTolerance,
-		DryRun:         *dryRun,
-		ProjectsDir:    *projectsDir,
-		SessionsDir:    *sessionsDir,
+		IdleThreshold: time.Duration(*idleMin) * time.Minute,
+		ScanInterval:  time.Duration(*intervalMin) * time.Minute,
+		DryRun:        *dryRun,
+		ProjectsDir:   *projectsDir,
 	}
 
 	j := janitor.New(cfg, os.Stdout)

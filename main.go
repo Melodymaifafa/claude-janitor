@@ -8,8 +8,7 @@
 //	  --dry-run            print "would kill X", do not kill
 //	  --idle-min N         idle threshold in minutes (default 120)
 //	  --interval-min N     scan interval in minutes (default 30; consumed by scheduler)
-//	  --projects-dir PATH  override A-class transcript root (~/.claude/projects)
-//	  --sessions-dir PATH  override B-class desktop session root (per-OS default)
+//	  --projects-dir PATH  override transcript root (~/.claude/projects)
 //	claude-janitor install [flags]     # register the periodic scan on the OS scheduler (MEL-93)
 //	claude-janitor uninstall [flags]   # remove the scheduled job
 //
@@ -73,8 +72,7 @@ Scan flags (run):
   --dry-run            print what would be killed, do not kill
   --idle-min N         idle threshold in minutes (default 120)
   --interval-min N     scan interval in minutes (default 30; used by scheduler)
-  --projects-dir PATH  override A-class transcript root (~/.claude/projects)
-  --sessions-dir PATH  override B-class desktop session root (per-OS default)
+  --projects-dir PATH  override transcript root (~/.claude/projects)
 
 Run "claude-janitor install --help" for scheduler flags.
 `)

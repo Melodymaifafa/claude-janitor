@@ -1,6 +1,8 @@
 package janitor
 
 import (
+	"strings"
+
 	"github.com/shirou/gopsutil/v3/process"
 )
 
@@ -34,13 +36,28 @@ func killProcessTree(pid int32, dryRun bool) []int32 {
 	return killed
 }
 
-// wrapperParent returns the ppid of p, or -1 if unavailable.
+// wrapperParent returns the parent pid only when the parent is the desktop
+// app's disclaimer wrapper. Terminal sessions are parented by the user's
+// shell -- killing that would take out their terminal tab -- so any
+// non-disclaimer parent returns -1 (nothing above the session is killed).
 func wrapperParent(p *process.Process) int32 {
-	ppid, err := p.Ppid()
-	if err != nil {
+	parent, err := p.Parent()
+	if err != nil || parent == nil {
 		return -1
 	}
-	return ppid
+	cmd, err := parent.Cmdline()
+	if err != nil || !isDisclaimerWrapper(cmd) {
+		return -1
+	}
+	return parent.Pid
+}
+
+// isDisclaimerWrapper matches the desktop app's disclaimer helper in a command
+// line. Separators and case are normalized first, the way mentionsClaudeBinary
+// does it, so a Windows parent written with backslashes is recognized too.
+func isDisclaimerWrapper(cmd string) bool {
+	cmd = strings.ToLower(strings.ReplaceAll(cmd, "\\", "/"))
+	return strings.Contains(cmd, "helpers/disclaimer")
 }
 
 func killTreeRecursive(p *process.Process, dryRun bool) []int32 {

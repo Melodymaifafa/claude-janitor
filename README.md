@@ -10,13 +10,16 @@ periodically.
 
 ## What it does
 
-Each pass finds and kills two kinds of idle Claude Code sessions:
+Each pass finds and kills two kinds of idle Claude Code sessions. Both are judged
+by the same signal: the mtime of the session's transcript
+(`~/.claude/projects/*/<uuid>.jsonl`), which every message updates.
 
-- **Terminal `--resume` sessions** — idle judged by the mtime of
-  `~/.claude/projects/*/<uuid>.jsonl`.
-- **Desktop-app background sessions** — idle judged by the mtime of the desktop
-  app's per-session JSON, matched back to a running process by start time. These
-  ignore `SIGTERM`, so they get `SIGKILL`.
+- **Terminal `--resume` sessions** — the transcript uuid is in the command line.
+- **Desktop-app background sessions** — no uuid in the command line, so each
+  process is paired to the transcript born just after it started (measured 4–14 s
+  on a real Mac). When several transcripts could be its own, it is killed only if
+  every one of them is stale; when none can be, it is left alone rather than
+  killed on a guess. These sessions ignore `SIGTERM`, so they get `SIGKILL`.
 
 Active sessions have a fresh transcript mtime, so they are never touched. Session
 files are never deleted — you can always resume.
@@ -97,8 +100,7 @@ claude-janitor run --dry-run
 | `--dry-run` | off | print what would be killed, kill nothing |
 | `--idle-min N` | `120` | a session idle for more than N minutes is dead |
 | `--interval-min N` | `30` | scan interval in minutes (recorded for the scheduler) |
-| `--projects-dir PATH` | per-OS | override the terminal-transcript root |
-| `--sessions-dir PATH` | per-OS | override the desktop-app session root |
+| `--projects-dir PATH` | `~/.claude/projects` | override the transcript root (both session kinds) |
 
 ### Run it on a schedule
 
@@ -148,8 +150,9 @@ goreleaser check
 goreleaser release --snapshot --clean   # builds all binaries into ./dist
 ```
 
-## Reference implementation
+## Design
 
-The proven Mac logic lives in `~/.claude/scripts/claude-session-janitor.sh`
-(launchd, every 30 min). This repo ports it to a single Go binary; the full
-cross-platform design is in [`docs/design.md`](docs/design.md).
+This repo is the single source of truth for the janitor logic — it started as a
+port of a Mac-only shell script, which is now retired. The full cross-platform
+design, including why idleness is judged by transcript mtime and nothing else,
+is in [`docs/design.md`](docs/design.md).

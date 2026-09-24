@@ -36,6 +36,10 @@ type Result struct {
 	Killed  int
 	Spared  int // active sessions left running
 	Skipped int // processes left alone: no transcript resolvable/pairable
+
+	// Claimed counts desktop processes whose transcript was established by
+	// direct evidence rather than by the timestamp window.
+	Claimed int
 }
 
 // Janitor runs scan-and-kill passes.
@@ -43,6 +47,11 @@ type Janitor struct {
 	cfg Config
 	out io.Writer
 	now func() time.Time
+
+	// claim asks a desktop process which transcript it owns; see claim.go. It
+	// is a field so tests can drive the decision logic without spawning
+	// processes -- the real implementation has its own tests against real ones.
+	claim func(procInfo) (string, bool)
 }
 
 // New builds a Janitor, filling unset knobs with defaults.
@@ -60,10 +69,15 @@ func New(cfg Config, out io.Writer) *Janitor {
 	if cfg.ProjectsDir == "" {
 		cfg.ProjectsDir = defaultProjectsDir()
 	}
+	if cfg.SessionsDir == "" {
+		cfg.SessionsDir = defaultSessionsDir()
+	}
 	if out == nil {
 		out = os.Stdout
 	}
-	return &Janitor{cfg: cfg, out: out, now: time.Now}
+	j := &Janitor{cfg: cfg, out: out, now: time.Now}
+	j.claim = j.claimedSessionID
+	return j
 }
 
 // Run executes a single scan-and-kill pass over both session classes.
@@ -84,8 +98,12 @@ func (j *Janitor) Run() (Result, error) {
 	if j.cfg.DryRun {
 		suffix = " [dry-run]"
 	}
-	j.logf("done: killed %d, spared(active) %d, skipped %d%s",
-		res.Killed, res.Spared, res.Skipped, suffix)
+	// Claimed is worth printing: it is the count of desktop sessions judged on
+	// what the session itself said it owns rather than on a timestamp guess, so
+	// a pass that reports zero of them on a Mac full of desktop sessions is the
+	// signal that the evidence chain stopped working.
+	j.logf("done: killed %d, spared(active) %d, skipped %d, desktop-by-claim %d%s",
+		res.Killed, res.Spared, res.Skipped, res.Claimed, suffix)
 	return res, nil
 }
 
@@ -117,13 +135,94 @@ func (j *Janitor) scanTerminal(procs []procInfo, now, cutoff time.Time, res *Res
 	}
 }
 
+// desktopDecision is what one pass concluded about one desktop process.
+type desktopDecision struct {
+	tr     transcriptInfo // the transcript whose mtime decides
+	ok     bool           // false: nothing may be concluded, never kill
+	direct bool           // the process named this transcript itself
+	ncand  int            // candidates considered (timestamp route only)
+	reason string         // why nothing may be concluded
+}
+
+// decideDesktop resolves every desktop process to the transcript whose mtime
+// decides its fate, in two tiers of decreasing evidence.
+//
+//  1. THE PROCESS'S OWN CLAIM. It names its transcript through its environment
+//     and the desktop app's record of that session (claim.go). Exact, with no
+//     timestamp in the chain, so it is immune to both failure modes timestamps
+//     have: a batch whose transcripts appeared out of order, and a dead
+//     sibling's transcript sitting in a re-opened session's window. A claimed
+//     transcript is also withdrawn from the pool, so no other process can be
+//     paired to it -- which repairs the neighbours of a claiming process even
+//     when they claim nothing themselves.
+//
+//  2. THE TIMESTAMP WINDOW. A process that claims nothing goes through the
+//     order-preserving, no-guessing pairing in pairing.go unchanged, and is
+//     killed only when every transcript it could own is stale. A third tier
+//     that compared working directories was measured and rejected; claim.go
+//     records the counterexample.
+func (j *Janitor) decideDesktop(bprocs []procInfo, trs []transcriptInfo) map[int32]desktopDecision {
+	out := make(map[int32]desktopDecision, len(bprocs))
+	byID := make(map[string]transcriptInfo, len(trs))
+	for _, tr := range trs {
+		byID[transcriptID(tr.path)] = tr
+	}
+
+	// Tier 1.
+	claimedPath := make(map[string]bool)
+	var rest []procInfo
+	for _, p := range bprocs {
+		id, ok := "", false
+		if j.claim != nil {
+			id, ok = j.claim(p)
+		}
+		if !ok {
+			rest = append(rest, p)
+			continue
+		}
+		tr, known := byID[id]
+		if !known {
+			// The process named a transcript this pass cannot see: a live
+			// terminal session holds it, or it has not been created yet. Either
+			// way the timestamp route must not adopt the process, because its
+			// real transcript is not among the candidates.
+			out[p.pid] = desktopDecision{reason: "claims a transcript this pass cannot read"}
+			continue
+		}
+		claimedPath[tr.path] = true
+		out[p.pid] = desktopDecision{tr: tr, ok: true, direct: true}
+	}
+
+	if len(rest) == 0 {
+		return out
+	}
+
+	// A claimed transcript has a known owner and is withdrawn from the pool.
+	pool := make([]transcriptInfo, 0, len(trs))
+	for _, tr := range trs {
+		if !claimedPath[tr.path] {
+			pool = append(pool, tr)
+		}
+	}
+
+	// Tier 2.
+	paired := j.pairDesktop(rest, pool)
+	for _, p := range rest {
+		v := paired[p.pid]
+		newest, ok := v.decisive()
+		if !ok {
+			out[p.pid] = desktopDecision{reason: unpairableReason(v)}
+			continue
+		}
+		out[p.pid] = desktopDecision{tr: newest.tr, ok: true, ncand: len(v.candidates)}
+	}
+	return out
+}
+
 // scanDesktop handles B-class: desktop background sessions (--output-format
-// stream-json, no --resume). pairDesktop reports every transcript each process
-// could own; the process is killed only when all of them are stale, so it is
-// idle whichever one is really its own. A process the pairing cannot place is
-// NEVER killed -- a re-opened session appends its old transcript, whose birth
-// predates the new process, so it cannot pair at all, and leaking one process
-// beats killing an active session.
+// stream-json, no --resume). decideDesktop names the transcript whose mtime
+// judges each process; a process it cannot resolve is NEVER killed, because
+// leaking one process beats killing an active session.
 func (j *Janitor) scanDesktop(procs []procInfo, now, cutoff time.Time, res *Result) {
 	var bprocs []procInfo
 	for _, p := range procs {
@@ -143,24 +242,42 @@ func (j *Janitor) scanDesktop(procs []procInfo, now, cutoff time.Time, res *Resu
 		j.logf("transcript birth times unavailable (%d files); desktop sessions left untouched", noBtime)
 	}
 
-	paired := j.pairDesktop(bprocs, trs)
+	decided := j.decideDesktop(bprocs, trs)
 	for _, p := range bprocs {
-		v := paired[p.pid]
-		newest, ok := v.decisive()
-		if !ok {
+		d := decided[p.pid]
+		if !d.ok {
 			res.Skipped++
 			j.logf("skip (%s, never killed) PID=%d started=%s",
-				unpairableReason(v), p.pid, p.createdAt.Format("01-02 15:04:05"))
+				d.reason, p.pid, p.createdAt.Format("01-02 15:04:05"))
 			continue
 		}
-		if newest.tr.mtime.After(cutoff) {
+		if d.direct {
+			res.Claimed++
+		}
+		if d.tr.mtime.After(cutoff) {
 			res.Spared++
 			continue
 		}
 		killed := killProcessTree(p.pid, j.cfg.DryRun)
-		j.report("desktop", p.pid, pairRef(v, newest), now.Sub(newest.tr.mtime), killed)
+		j.report("desktop", p.pid, decisionRef(d), now.Sub(d.tr.mtime), killed)
 		res.Killed++
 	}
+}
+
+// decisionRef describes what the kill decision was based on.
+func decisionRef(d desktopDecision) string {
+	if d.direct {
+		return "claimed " + transcriptID(d.tr.path)
+	}
+	if d.ncand == 1 {
+		return filepath.Base(d.tr.path) + " (window)"
+	}
+	return fmt.Sprintf("%d candidates, all stale", d.ncand)
+}
+
+// transcriptID is the session id a transcript path names.
+func transcriptID(path string) string {
+	return strings.ToLower(strings.TrimSuffix(filepath.Base(path), ".jsonl"))
 }
 
 // unpairableReason names why a process was left alone, so the ordinary
@@ -170,14 +287,6 @@ func unpairableReason(v pairVerdict) string {
 		return "unpairable"
 	}
 	return "owner not certain"
-}
-
-// pairRef describes what the kill decision was based on.
-func pairRef(v pairVerdict, newest pairAssignment) string {
-	if len(v.candidates) == 1 {
-		return fmt.Sprintf("%s pair-gap %ds", filepath.Base(newest.tr.path), int(newest.gap.Seconds()))
-	}
-	return fmt.Sprintf("%d candidates, all stale", len(v.candidates))
 }
 
 // transcriptInfo is one projects/*/*.jsonl candidate for B-class pairing.

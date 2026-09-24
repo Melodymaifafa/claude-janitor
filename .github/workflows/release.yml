@@ -3,8 +3,13 @@ name: release
 # Builds and publishes cross-platform binaries when a v* tag is pushed.
 # Archives + checksums + the GitHub Release need no extra setup (GITHUB_TOKEN is
 # automatic). The Homebrew / Scoop / Winget manifest pushes need registry repos
-# and PATs that only the repo owner can create -- see README "Publishing". Until
-# those secrets exist, the release still produces downloadable binaries.
+# and PATs that only the repo owner can create -- see README "Publishing".
+#
+# The three secrets below are optional: an absent secret arrives here as an empty
+# string, and the matching skip_upload guard in .goreleaser.yaml turns that one
+# publish step into a skip. So this job stays green and still ships the six
+# binaries with none of them set, and each store switches on the moment its
+# secret is added. Do not remove the env lines -- goreleaser reads them.
 
 on:
   push:

@@ -7,7 +7,7 @@
 #
 # Once binary releases exist (goreleaser + GitHub Actions, .goreleaser.yaml),
 # the published one-liner becomes:
-#     curl -fsSL https://raw.githubusercontent.com/maicuigua/claude-janitor/main/install.sh | sh
+#     curl -fsSL https://raw.githubusercontent.com/Melodymaifafa/claude-janitor/main/install.sh | sh
 # and this script downloads the matching release archive instead of building.
 # Set CLAUDE_JANITOR_RELEASE_URL to force the download path.
 #
@@ -16,7 +16,7 @@
 set -eu
 
 BIN=claude-janitor
-REPO_RAW="https://raw.githubusercontent.com/maicuigua/claude-janitor/main"
+REPO_RAW="https://raw.githubusercontent.com/Melodymaifafa/claude-janitor/main"
 
 log()  { printf '%s\n' "$*"; }
 die()  { printf 'install.sh: %s\n' "$*" >&2; exit 1; }

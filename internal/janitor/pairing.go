@@ -26,7 +26,13 @@ import (
 //     a live terminal (--resume) session belongs to no desktop process at all
 //     (see reservedUUIDs).
 //
-//  3. NO GUESSING. Transcripts are never deleted, so a window can hold more
+//  3. NO INVENTED ORDER. Processes that start inside the same timestamp quantum
+//     carry no order at all -- process ids are not launch order. Such a group is
+//     treated as interchangeable: each member could own any of the group's
+//     transcripts, so the group is condemned only when none of them is being
+//     written.
+//
+//  4. NO GUESSING. Transcripts are never deleted, so a window can hold more
 //     transcripts than there are live processes -- the sessions launched in the
 //     same batch that have since exited leave theirs behind. A rule that picks
 //     the "most plausible" candidate then hands a survivor an orphan's
@@ -109,9 +115,11 @@ func (j *Janitor) pairDesktop(procs []procInfo, trs []transcriptInfo) map[int32]
 	}
 
 	// Sorting both sides by time makes "index-monotone" mean "order-preserving",
-	// which is what the two passes below enforce. pid and path break exact ties
-	// so the same machine state always reaches the same answer; gopsutil reports
-	// start times in whole milliseconds, so a batch really can share one.
+	// which is what the two passes below enforce. pid and path only keep the sort
+	// deterministic on exact ties; pid is NOT evidence of launch order, so equal
+	// start times are un-ordered again after the matching (see the merge below).
+	// gopsutil reports start times in whole milliseconds, so a batch really can
+	// share one.
 	ps := make([]procInfo, len(procs))
 	copy(ps, procs)
 	sort.Slice(ps, func(a, b int) bool {
@@ -220,6 +228,41 @@ func (j *Janitor) pairDesktop(procs []procInfo, trs []transcriptInfo) map[int32]
 			}
 		}
 		out[ps[i].pid] = v
+	}
+
+	// Processes sharing a start timestamp have identical windows, so every
+	// ordering among them fits the evidence equally well and the sort above had
+	// to invent one -- pid order is not launch order on any platform. Permuting
+	// such a group only permutes its transcripts among its members, so the set a
+	// member could own is the group's union. Giving each member that union means a
+	// stale transcript can condemn the group only when none of them is being
+	// written.
+	for a := 0; a < n; {
+		b := a + 1
+		for b < n && ps[b].createdAt.Equal(ps[a].createdAt) {
+			b++
+		}
+		if b-a > 1 {
+			merged := make([]pairAssignment, 0, 2*(b-a))
+			seen := make(map[string]bool, 2*(b-a))
+			forced := true
+			for i := a; i < b; i++ {
+				v := out[ps[i].pid]
+				if !v.forced {
+					forced = false
+				}
+				for _, c := range v.candidates {
+					if !seen[c.tr.path] {
+						seen[c.tr.path] = true
+						merged = append(merged, c)
+					}
+				}
+			}
+			for i := a; i < b; i++ {
+				out[ps[i].pid] = pairVerdict{forced: forced, candidates: merged}
+			}
+		}
+		a = b
 	}
 	return out
 }

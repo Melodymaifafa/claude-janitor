@@ -267,3 +267,45 @@ func TestPairingNeverKillsAWritingSession(t *testing.T) {
 	}
 	t.Logf("checked %d active sessions across random batches", checked)
 }
+
+// TestPairDesktopEqualStartsAreInterchangeable: two desktop processes whose start
+// timestamps land in the same millisecond carry no launch order at all -- process
+// ids are not launch order on any platform. So neither may be condemned while
+// either transcript of the pair is still being written; once both go quiet, both
+// processes are collectable again.
+//
+// Inputs are built in memory so this runs identically on every OS.
+func TestPairDesktopEqualStartsAreInterchangeable(t *testing.T) {
+	now := time.Now()
+	cutoff := now.Add(-120 * time.Minute)
+	start := now.Add(-4 * time.Hour)
+
+	build := func(secondMtime time.Time) map[int32]pairVerdict {
+		j := New(Config{ProjectsDir: t.TempDir(), DryRun: true}, &bytes.Buffer{})
+		trs := []transcriptInfo{
+			{btime: start.Add(9 * time.Second), mtime: start.Add(30 * time.Second), path: "/p/first.jsonl"},
+			{btime: start.Add(12 * time.Second), mtime: secondMtime, path: "/p/second.jsonl"},
+		}
+		// Identical createdAt: gopsutil reports whole milliseconds.
+		procs := []procInfo{bgProc(950001, start), bgProc(950002, start)}
+		return j.pairDesktop(procs, trs)
+	}
+
+	// One of the two is still writing -- nobody may be judged idle.
+	for pid, v := range build(now) {
+		c, ok := v.decisive()
+		if ok && !c.tr.mtime.After(cutoff) {
+			t.Errorf("PID=%d judged idle on %s while a sibling transcript is being written",
+				pid, c.tr.path)
+		}
+	}
+
+	// Both quiet -- both must still be collectable, or a same-millisecond batch
+	// would leak forever.
+	for pid, v := range build(start.Add(40 * time.Second)) {
+		c, ok := v.decisive()
+		if !ok || c.tr.mtime.After(cutoff) {
+			t.Errorf("PID=%d not collectable although every candidate transcript is stale (ok=%v)", pid, ok)
+		}
+	}
+}

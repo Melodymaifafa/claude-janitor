@@ -3,12 +3,14 @@ package janitor
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -361,3 +363,201 @@ func TestProcEnvironOnThisPlatform(t *testing.T) {
 		t.Errorf("%s = %q, want %q (read %d variables)", hostSessionEnvVar, env[hostSessionEnvVar], hostID, len(env))
 	}
 }
+
+// oldTierOne is the tier 1 this file's fix replaced: every process that named a
+// transcript was marked its direct owner, with no check that anybody else had
+// named the same one. It is kept here as the "before" arm of the co-claim
+// scenario, so that test shows a real difference on real data rather than
+// asserting the new behaviour against itself.
+func oldTierOne(j *Janitor, bprocs []procInfo, trs []transcriptInfo) map[int32]desktopDecision {
+	byID := make(map[string]transcriptInfo, len(trs))
+	for _, tr := range trs {
+		byID[transcriptID(tr.path)] = tr
+	}
+	out := make(map[int32]desktopDecision, len(bprocs))
+	for _, p := range bprocs {
+		id, ok := j.claim(p)
+		if !ok {
+			continue
+		}
+		if tr, known := byID[id]; known {
+			out[p.pid] = desktopDecision{tr: tr, ok: true, direct: true}
+		}
+	}
+	return out
+}
+
+// TestCoClaimedTranscriptKillsNobody is the failure mode the claim itself
+// introduced. A process's environment is copied into every child it starts, so
+// the desktop session's id travels to programs the session launched; when one
+// of those starts a session of its own, two live processes name the SAME
+// transcript. Measured on this Mac 2026-09-24: two host session ids, four live
+// processes each, so this is ordinary rather than exotic.
+//
+// Marking both the direct owner judges the one that is really writing a
+// different transcript by the shared transcript's silence, and kills it
+// mid-task -- the exact thing the ticket exists to stop, re-entering through
+// the fix. Two namers mean the pass cannot tell which owns it, so it must
+// conclude nothing about either.
+func TestCoClaimedTranscriptKillsNobody(t *testing.T) {
+	s := newClaimScenario(t)
+	const (
+		hostShared = "local_88888888-8888-8888-8888-888888888888"
+		idShared   = "ffffffff-8888-4888-8888-ffffffffffff"
+		idOwn      = "99999999-9999-4999-8999-999999999999"
+	)
+
+	// Two live sessions carrying one host session id: the desktop session and
+	// the session a program it started launched with the inherited environment.
+	owner := realProc(t, s.bindir, s.workdir, hostShared)
+	time.Sleep(150 * time.Millisecond)
+	inheritor := realProc(t, s.bindir, s.workdir, hostShared)
+
+	sharedTr := writeTranscript(t, s.projectDir, idShared, s.workdir)
+	time.Sleep(150 * time.Millisecond)
+	ownTr := writeTranscript(t, s.projectDir, idOwn, s.workdir)
+	writeSessionRecord(t, s.sessionsDir, hostShared, idShared, s.workdir)
+
+	// The shared transcript goes quiet; the second session keeps writing its
+	// own. A live process cannot be aged, so the threshold moves instead.
+	const threshold = 900 * time.Millisecond
+	time.Sleep(threshold + 300*time.Millisecond)
+	touchNow(t, ownTr)
+	_ = sharedTr
+
+	procs := []procInfo{owner, inheritor}
+	j := New(Config{
+		ProjectsDir:   filepath.Dir(s.projectDir),
+		SessionsDir:   s.sessionsDir,
+		IdleThreshold: threshold,
+		PairBefore:    15 * time.Second,
+		PairAfter:     30 * time.Second,
+		DryRun:        true,
+	}, &bytes.Buffer{})
+	trs, _ := j.listTranscripts(nil)
+	cutoff := time.Now().Add(-threshold)
+
+	// Before: both are certain owners of one stale transcript, so both die --
+	// including the one whose own transcript was written a moment ago.
+	before := oldTierOne(j, procs, trs)
+	for _, p := range procs {
+		d := before[p.pid]
+		if !d.ok || d.tr.mtime.After(cutoff) {
+			t.Fatalf("PID=%d was expected to be condemned by the shared transcript (ok=%v); the scenario no longer reproduces", p.pid, d.ok)
+		}
+		if transcriptID(d.tr.path) != idShared {
+			t.Fatalf("PID=%d was judged on %s, want the shared transcript", p.pid, filepath.Base(d.tr.path))
+		}
+	}
+
+	// After: contested, so nothing is concluded about either.
+	after := j.decideDesktop(procs, trs)
+	for _, p := range procs {
+		d := after[p.pid]
+		if d.ok {
+			t.Errorf("PID=%d was judged on %s although another live process names the same transcript",
+				p.pid, filepath.Base(d.tr.path))
+		}
+		if !strings.Contains(d.reason, "several processes claim") {
+			t.Errorf("PID=%d skipped for %q, want the co-claim reason", p.pid, d.reason)
+		}
+	}
+
+	// And the whole pass kills neither.
+	if killed := s.run(t, s.sessionsDir, threshold, 15*time.Second, 30*time.Second, procs); len(killed) != 0 {
+		t.Errorf("a pass killed %v; two processes naming one transcript must kill nobody", killed)
+	}
+}
+
+// TestClaimResolvesWithoutBirthTimes covers the systems where the fix used to
+// switch itself off. Listing the transcripts dropped every file whose creation
+// time the OS will not report -- a Linux filesystem without statx support --
+// before the id lookup was built, so a session that named its own transcript
+// was told the pass could not read it, and the whole direct-evidence route went
+// dark there. A claim needs only the mtime every filesystem reports.
+//
+// The processes and files here are real; what is simulated is the filesystem's
+// answer about creation time, which is the one thing a Mac cannot produce.
+func TestClaimResolvesWithoutBirthTimes(t *testing.T) {
+	s := newClaimScenario(t)
+	const (
+		hostID   = "local_aaaaaaaa-9999-9999-9999-aaaaaaaaaaaa"
+		idOwn    = "12121212-1212-4212-8212-121212121212"
+		idOrphan = "13131313-1313-4313-8313-131313131313"
+	)
+	p := realProc(t, s.bindir, s.workdir, hostID)
+	tr := writeTranscript(t, s.projectDir, idOwn, s.workdir)
+	writeTranscript(t, s.projectDir, idOrphan, s.workdir) // nobody names this one
+	writeSessionRecord(t, s.sessionsDir, hostID, idOwn, s.workdir)
+
+	// A process that names nothing, started early enough that the unclaimed
+	// transcript would land inside its window if the window were usable at all.
+	quiet := bgProc(990001, time.Now().Add(-2*time.Second))
+
+	const threshold = 900 * time.Millisecond
+	time.Sleep(threshold + 300*time.Millisecond)
+
+	// blindfold answers the way a filesystem with no creation time does.
+	blindfold := func(j *Janitor) {
+		j.stat = func(path string) (fileTimes, error) {
+			ft, err := statTimes(path)
+			ft.btime, ft.hasBtime = ft.mtime, false
+			return ft, err
+		}
+	}
+
+	pass := func(old bool) (Result, string) {
+		buf := &bytes.Buffer{}
+		j := New(Config{
+			ProjectsDir:   filepath.Dir(s.projectDir),
+			SessionsDir:   s.sessionsDir,
+			IdleThreshold: threshold,
+			PairBefore:    15 * time.Second,
+			PairAfter:     30 * time.Second,
+			DryRun:        true,
+		}, buf)
+		blindfold(j)
+		if old {
+			// The listing as it was: files with no creation time never reached
+			// the caller, so the id lookup could not see them either.
+			inner := j.stat
+			j.stat = func(path string) (fileTimes, error) {
+				ft, err := inner(path)
+				if err == nil && !ft.hasBtime {
+					err = errNoBirthTime
+				}
+				return ft, err
+			}
+		}
+		now := time.Now()
+		var res Result
+		j.scanDesktop([]procInfo{p, quiet}, now, now.Add(-threshold), &res)
+		return res, buf.String()
+	}
+
+	// Before: nothing was readable, so the session that names its own
+	// transcript was skipped and the fix did not exist on those systems.
+	if res, log := pass(true); res.Claimed != 0 || res.Killed != 0 {
+		t.Fatalf("the old listing resolved a claim after all (claimed=%d killed=%d); the scenario no longer reproduces\n%s",
+			res.Claimed, res.Killed, log)
+	}
+
+	// After: the claim resolves on mtime alone and the idle session is
+	// collected, while the process that names nothing stays unjudged -- the
+	// timestamp route must still refuse these files, whose birth time is a
+	// stand-in for an mtime that on an append-forever transcript reads as "now".
+	res, log := pass(false)
+	if res.Claimed != 1 || res.Killed != 1 {
+		t.Errorf("claim did not resolve without a birth time: claimed=%d killed=%d\n%s", res.Claimed, res.Killed, log)
+	}
+	if res.Skipped != 1 {
+		t.Errorf("skipped=%d, want the process that names nothing left unjudged on files with no birth time\n%s", res.Skipped, log)
+	}
+	if !strings.Contains(log, "claimed "+idOwn[:8]) { // the log truncates the id
+		t.Errorf("the pass did not name the claimed transcript %s\n%s", filepath.Base(tr), log)
+	}
+}
+
+// errNoBirthTime stands in for the stat failure the old listing turned a
+// missing creation time into: the file never reached the caller at all.
+var errNoBirthTime = errors.New("no birth time")

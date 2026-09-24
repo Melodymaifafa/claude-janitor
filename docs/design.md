@@ -114,12 +114,15 @@ reproduced):
   from the candidate pool before matching. Otherwise a desktop process can claim
   a terminal session's transcript when that transcript's birth sits closer to the
   desktop process's start, and is then judged by a stranger's mtime.
-- **No invented order.** `gopsutil` reports process start times in whole
-  milliseconds, so a batch can share one, and process ids are not launch order on
-  any platform. Processes with an identical start timestamp are therefore treated
-  as interchangeable: each is given the whole group's candidate set, so the group
-  is condemned only when none of its transcripts is being written, and collected
-  normally once they all go quiet.
+- **No invented order.** Equal timestamps carry no order, and the sort's
+  tie-breaks are not evidence. `gopsutil` reports process start times in whole
+  milliseconds so a batch can share one, and process ids are not launch order on
+  any platform; likewise a coarse filesystem timestamp gives two transcripts the
+  same birth time, and their paths say nothing about who created them. Processes
+  sharing a start timestamp, and transcripts sharing a birth time, are therefore
+  treated as interchangeable groups: each member is given the whole group's
+  candidates, so the group is condemned only when none of its transcripts is being
+  written, and collected normally once they all go quiet.
 - **No guessing.** Transcripts are never deleted, so a window routinely holds
   more transcripts than there are live processes: the sessions launched in the
   same batch that have since exited leave theirs behind forever. Choosing the

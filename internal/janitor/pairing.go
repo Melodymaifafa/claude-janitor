@@ -26,10 +26,11 @@ import (
 //     a live terminal (--resume) session belongs to no desktop process at all
 //     (see reservedUUIDs).
 //
-//  3. NO INVENTED ORDER. Processes that start inside the same timestamp quantum
-//     carry no order at all -- process ids are not launch order. Such a group is
-//     treated as interchangeable: each member could own any of the group's
-//     transcripts, so the group is condemned only when none of them is being
+//  3. NO INVENTED ORDER. Equal timestamps carry no order: process ids are not
+//     launch order, and file paths are not creation order. Processes sharing a
+//     start timestamp, and transcripts sharing a birth timestamp, are each
+//     treated as interchangeable groups -- every member could be any member's --
+//     so such a group is condemned only when none of its transcripts is being
 //     written.
 //
 //  4. NO GUESSING. Transcripts are never deleted, so a window can hold more
@@ -149,6 +150,23 @@ func (j *Janitor) pairDesktop(procs []procInfo, trs []transcriptInfo) map[int32]
 		return ts[a].path < ts[b].path
 	})
 
+	// Transcripts sharing a birth timestamp are un-ordered for the same reason
+	// equal-start processes are: the path tie-break above is not evidence, and a
+	// coarse filesystem timestamp coalesces files created close together. Each
+	// index records its group, so a candidate drags in the whole group below.
+	groupStart := make([]int, len(ts))
+	groupEnd := make([]int, len(ts))
+	for a := 0; a < len(ts); {
+		b := a + 1
+		for b < len(ts) && ts[b].btime.Equal(ts[a].btime) {
+			b++
+		}
+		for i := a; i < b; i++ {
+			groupStart[i], groupEnd[i] = a, b
+		}
+		a = b
+	}
+
 	n, m := len(ps), len(ts)
 	for _, p := range ps {
 		out[p.pid] = pairVerdict{}
@@ -211,12 +229,21 @@ func (j *Janitor) pairDesktop(procs []procInfo, trs []transcriptInfo) map[int32]
 
 	for i := 0; i < n; i++ {
 		v := pairVerdict{forced: total > 0}
+		taken := make([]bool, m)
 		for k := 0; k < m; k++ {
 			// Keep transcript k for process i when some maximum pairing uses that
 			// very pair: everything before it plus this pair plus everything after
-			// it still adds up to a maximum.
-			if gap[i][k] != noPair && pre[i][k]+1+suf[i+1][k+1] == total {
-				v.candidates = append(v.candidates, pairAssignment{tr: ts[k], gap: gap[i][k]})
+			// it still adds up to a maximum. Members of k's birth-time group are
+			// interchangeable with it, so they come along.
+			if gap[i][k] == noPair || pre[i][k]+1+suf[i+1][k+1] != total {
+				continue
+			}
+			for g := groupStart[k]; g < groupEnd[k]; g++ {
+				if taken[g] {
+					continue
+				}
+				taken[g] = true
+				v.candidates = append(v.candidates, pairAssignment{tr: ts[g], gap: gap[i][g]})
 			}
 		}
 		// A maximum pairing that skips this process entirely means the evidence

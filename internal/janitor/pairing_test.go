@@ -206,21 +206,25 @@ func TestPairingNeverKillsAWritingSession(t *testing.T) {
 		sessions := 2 + rng.Intn(4)
 
 		// Launch the batch, each session's transcript born after its own start.
+		// Zero spacing and a coarse birth-time grid are deliberate: they produce
+		// the equal-timestamp groups where no order exists to be read.
+		grid := time.Duration(1+rng.Intn(6)) * time.Second
 		starts := make([]time.Time, sessions)
 		births := make([]time.Time, sessions)
 		at := base
 		for i := 0; i < sessions; i++ {
-			at = at.Add(time.Duration(1+rng.Intn(20)) * time.Second)
+			at = at.Add(time.Duration(rng.Intn(21)) * time.Second)
 			starts[i] = at
-			births[i] = at.Add(time.Duration(4+rng.Intn(11)) * time.Second)
+			born := at.Add(time.Duration(4+rng.Intn(11)) * time.Second)
+			births[i] = born.Truncate(grid)
 		}
-		ordered := true
+		inverted := false
 		for i := 1; i < sessions; i++ {
-			if !births[i].After(births[i-1]) {
-				ordered = false
+			if births[i].Before(births[i-1]) {
+				inverted = true
 			}
 		}
-		if !ordered {
+		if inverted {
 			continue // outside the supported regime; see the doc comment
 		}
 
@@ -236,10 +240,13 @@ func TestPairingNeverKillsAWritingSession(t *testing.T) {
 			if writing[i] {
 				mtime = now.Add(-time.Duration(rng.Intn(30)) * time.Second)
 			}
+			// A random name key: on disk, path order tells you nothing about
+			// creation order, and a generator whose paths happen to sort in launch
+			// order would hide exactly that.
 			trs = append(trs, transcriptInfo{
 				btime: births[i],
 				mtime: mtime,
-				path:  fmt.Sprintf("/p/sess-%02d.jsonl", i),
+				path:  fmt.Sprintf("/p/%04d-sess-%02d.jsonl", rng.Intn(10000), i),
 			})
 			if alive[i] {
 				procs = append(procs, bgProc(int32(1000+i), starts[i]))
@@ -303,6 +310,43 @@ func TestPairDesktopEqualStartsAreInterchangeable(t *testing.T) {
 	// Both quiet -- both must still be collectable, or a same-millisecond batch
 	// would leak forever.
 	for pid, v := range build(start.Add(40 * time.Second)) {
+		c, ok := v.decisive()
+		if !ok || c.tr.mtime.After(cutoff) {
+			t.Errorf("PID=%d not collectable although every candidate transcript is stale (ok=%v)", pid, ok)
+		}
+	}
+}
+
+// TestPairDesktopEqualBirthTimesAreInterchangeable: the mirror of the case above
+// on the transcript side. A coarse filesystem timestamp can give two transcripts
+// the same birth time, and the sort then has only their paths to go on -- which
+// says nothing about who created them. So while either is being written, neither
+// of the two processes may be condemned; once both go quiet, both are collectable.
+func TestPairDesktopEqualBirthTimesAreInterchangeable(t *testing.T) {
+	now := time.Now()
+	cutoff := now.Add(-120 * time.Minute)
+	base := now.Add(-4 * time.Hour)
+	born := base.Add(10 * time.Second) // one timestamp for both transcripts
+
+	build := func(secondMtime time.Time) map[int32]pairVerdict {
+		j := New(Config{ProjectsDir: t.TempDir(), DryRun: true}, &bytes.Buffer{})
+		trs := []transcriptInfo{
+			{btime: born, mtime: base.Add(30 * time.Second), path: "/p/aaa.jsonl"},
+			{btime: born, mtime: secondMtime, path: "/p/bbb.jsonl"},
+		}
+		procs := []procInfo{bgProc(960001, base), bgProc(960002, base.Add(4*time.Second))}
+		return j.pairDesktop(procs, trs)
+	}
+
+	for pid, v := range build(now) {
+		c, ok := v.decisive()
+		if ok && !c.tr.mtime.After(cutoff) {
+			t.Errorf("PID=%d judged idle on %s while a same-birth-time transcript is being written",
+				pid, c.tr.path)
+		}
+	}
+
+	for pid, v := range build(base.Add(40 * time.Second)) {
 		c, ok := v.decisive()
 		if !ok || c.tr.mtime.After(cutoff) {
 			t.Errorf("PID=%d not collectable although every candidate transcript is stale (ok=%v)", pid, ok)

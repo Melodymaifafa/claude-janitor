@@ -46,10 +46,18 @@ func wrapperParent(p *process.Process) int32 {
 		return -1
 	}
 	cmd, err := parent.Cmdline()
-	if err != nil || !strings.Contains(cmd, "Helpers/disclaimer") {
+	if err != nil || !isDisclaimerWrapper(cmd) {
 		return -1
 	}
 	return parent.Pid
+}
+
+// isDisclaimerWrapper matches the desktop app's disclaimer helper in a command
+// line. Separators and case are normalized first, the way mentionsClaudeBinary
+// does it, so a Windows parent written with backslashes is recognized too.
+func isDisclaimerWrapper(cmd string) bool {
+	cmd = strings.ToLower(strings.ReplaceAll(cmd, "\\", "/"))
+	return strings.Contains(cmd, "helpers/disclaimer")
 }
 
 func killTreeRecursive(p *process.Process, dryRun bool) []int32 {

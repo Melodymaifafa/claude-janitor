@@ -69,3 +69,31 @@ func TestIsUUID(t *testing.T) {
 		t.Error("non-hex accepted")
 	}
 }
+
+// TestIsDisclaimerWrapper: the desktop app's wrapper parent is the only parent
+// the janitor may kill above a session, so it has to be recognized on all three
+// OSes -- a Windows parent writes the same path with backslashes -- and a
+// terminal session's shell parent must never match, or killing it would take out
+// the user's terminal tab.
+func TestIsDisclaimerWrapper(t *testing.T) {
+	yes := []string{
+		"/Applications/Claude.app/Contents/Frameworks/Claude Helpers/disclaimer --flag",
+		`C:\Program Files\Claude\Helpers\disclaimer.exe --flag`,
+		`C:\PROGRAM FILES\CLAUDE\HELPERS\DISCLAIMER.EXE`,
+	}
+	for _, c := range yes {
+		if !isDisclaimerWrapper(c) {
+			t.Errorf("should match the wrapper: %q", c)
+		}
+	}
+	no := []string{
+		"/bin/zsh -l",
+		"node /usr/local/bin/claude --resume 12345678-1234-1234-1234-1234567890ab",
+		"",
+	}
+	for _, c := range no {
+		if isDisclaimerWrapper(c) {
+			t.Errorf("must not match a non-wrapper parent: %q", c)
+		}
+	}
+}

@@ -83,21 +83,76 @@ it only globs `projects/*/<uuid>.jsonl` and reads mtime. **Same logic all 3 OSes
 `--resume <uuid>`, extract the uuid, look up that `<uuid>.jsonl`. Cross-platform
 via `gopsutil` `process.CmdlineSlice()`.
 
-### B. Desktop-app background sessions — transcript pairing by birth time
+### B. Desktop-app background sessions — the session's own claim, then birth time
 
 B-class sessions write the **same** `projects/*/<id>.jsonl` transcripts as
 A-class (VERIFIED on Mac: the desktop app's `local_*.json` field
 `cliSessionId` names the transcript, which appears 4–14 s after the session
-process starts and is appended on every message). So B-class needs **no
-OS-divergent path at all** — only a way to map process → transcript:
+process starts and is appended on every message). So B-class needs no
+OS-divergent path for the *transcript* — only a way to map process →
+transcript:
 
 **Process identification (B):** processes with `--output-format stream-json`
-and no `--resume`. Pair each process to the transcript whose **birth time**
-falls in `[CreateTime−PairBefore, CreateTime+PairAfter]` (defaults 15 s /
-120 s; measured creation lag 4–14 s). A process with no pairable transcript
-(e.g. a re-opened session appending its old transcript, whose birth predates
-the new process) is **never killed** — leaking one process beats killing an
-active session.
+and no `--resume`. Each such process is resolved to its transcript in two
+tiers, evidence first (MEL-237):
+
+1. **The session's own claim, when it is the only one — exact, and no
+   timestamp in it.** A desktop session process carries
+   `CLAUDE_CODE_HOST_SESSION_ID` in its environment: the desktop app's id for
+   that session. The app's record of that session
+   (`claude-code-sessions/*/*/<hostId>.json`) states, in `cliSessionId`, which
+   transcript the session writes. Chained, that names the transcript exactly.
+   A claimed transcript is also withdrawn from the candidate pool, so no other
+   process can be paired to it — which fixes the neighbours of a claiming
+   process even when they claim nothing themselves. Implemented in
+   `internal/janitor/claim.go`.
+
+   **Exclusivity is part of the evidence** (MEL-237 review, 2026-09-24). An
+   environment is copied into every child process, so a program a desktop
+   session started carries that session's id, and a session IT starts names the
+   parent's transcript as its own. Measured on this Mac: one host session id
+   carried by 24 live processes, another by 10, another by 5. Two live
+   processes naming one transcript therefore happens, and it means one thing —
+   the pass cannot tell which of them owns it. Marking both certain owners
+   judges the one really writing a *different* transcript by the shared one's
+   silence and kills it mid-task, which is this ticket's own failure mode
+   re-entering through its fix. So **a contested transcript decides nobody**:
+   every claimant is left alone and none of them falls through to tier 2
+   either, because the transcript one of them is really writing has already
+   left the pool. Reproduced on real processes against the real binary: the
+   unfixed build printed `would kill` for both, the fixed build skips both.
+   *Boundary:* when the claimant that really owns the transcript has already
+   exited, a lone inheritor is the only namer left and is judged on the
+   inherited transcript. Nothing separates them — inheritance copies the whole
+   environment, so no variable distinguishes an inherited claim from an own
+   one, and another live namer is the only evidence there is.
+   **A claim needs no creation time.** Listing the transcripts once dropped
+   every file whose birth time the OS would not report (Linux filesystems
+   without `statx` support) before the id lookup was built, so on those systems
+   a session that named its own transcript was told the pass could not read it
+   and the direct-evidence route went dark — safe, but the fix did not exist
+   there. Those files are now listed and marked unpairable: the claim reads
+   mtime, which every filesystem reports, and only the timestamp window below
+   needs a real creation time (MEL-237 review, 2026-09-24).
+
+2. **The birth-time window, unchanged, for everything that claims nothing.**
+   Pair each remaining process to the transcripts whose **birth time** falls in
+   `[CreateTime−PairBefore, CreateTime+PairAfter]` (defaults 15 s / 120 s),
+   under the order-preserving, no-guessing rules below. A process with no
+   pairable transcript (e.g. a re-opened session appending its old transcript,
+   whose birth predates the new process) is **never killed** — leaking one
+   process beats killing an active session.
+
+This is **not** the 2026-07-30 regression returning. That incident judged
+*idleness* by the desktop session record's mtime — a UI-event snapshot that
+stops moving while a task runs (§0, still forbidden). Here that record is read
+for one string, the transcript id; idleness still comes from the transcript's
+own mtime and nothing else, and the lookup returns a string and never a time.
+§2.B already named `cliSessionId` as the **VERIFIED** statement of which
+transcript a desktop session owns. The per-OS path is also optional: when the
+directory is absent or shaped differently, no claim resolves and the pass
+degrades to exactly the behaviour it had before — nothing is killed because a
+path failed to answer.
 
 **The matching rule is order-preserving and never guesses** (corrected
 2026-09-24, MEL-231 review — the first version of this fix shipped a
@@ -136,28 +191,79 @@ reproduced):
 - Implementation in `internal/janitor/pairing.go`; kill/spare decision in
   `scanDesktop`. Exact timestamp ties break on pid and path, because `gopsutil`
   reports process start times in whole milliseconds and a batch can share one.
-- **Two residual limits, accepted.** Both need information timestamps do not
-  carry; closing either needs a **direct ownership signal** — an open file handle
-  on the transcript, or the session id recorded inside it — not a better timing
-  rule.
-  1. *Inverted birth order.* When the creation lag varies by more than the launch
-     spacing (14 s for one session, 4 s for one started 5 s later) the birth order
-     itself inverts, so the pairing lands on the wrong transcript of the batch.
-  2. *A re-opened session with an orphan in its window.* A re-opened session
-     appends its original transcript, whose birth predates the new process, so it
-     is out of window and cannot be a candidate. If a sibling that exited left
-     exactly one stale transcript born inside the window, the pass sees one
-     process and one candidate and treats it as certain. That data is
-     indistinguishable from the ordinary case of a lone desktop session whose own
-     transcript went stale — the case B-class cleanup exists for — so refusing to
-     kill on a single candidate would not make the tool safer, it would make it
-     inert. Reaching this needs a sibling transcript created within ~2 minutes of
-     the re-open that then stayed silent for the whole idle threshold while the
-     re-opened session kept working.
-- All three failure modes carry regression tests that assert **which pid** is
-  named (`internal/janitor/pairing_test.go`, `janitor_test.go`). The
+- **Both residual limits are closed (MEL-237, 2026-09-24).** They needed a
+  direct ownership signal rather than a better timing rule, and the claim above
+  is one. *Inverted birth order*: the pairing is never consulted for a session
+  that names its own transcript, so a batch whose transcripts appeared out of
+  order no longer misassigns. *A re-opened session with an orphan in its
+  window*: the re-opened session names the transcript it is really appending,
+  even though that transcript's birth predates the process and could never be a
+  candidate, so the orphan is no longer mistaken for its own. Both are covered
+  by regression tests built on real processes and real files
+  (`internal/janitor/claim_test.go`), each asserting that the timestamp-only
+  path kills the session that is actively writing and that the claim path does
+  not. The two holes the claim itself opened — a contested transcript, and a
+  filesystem with no creation time — carry their own tests in the same file,
+  each with a "before" arm that reproduces the old behaviour on the same
+  fixture so neither test can pass against itself.
+- **What was measured to get there, on this Mac, 2026-09-24.** The two routes
+  the ticket proposed were tested before anything was written:
+  - *An open file handle on the transcript* — **DEAD**. Claude Code does not
+    hold its transcript open: across 16 live `claude` processes, zero file
+    descriptors pointed at any `.jsonl` or anything under `~/.claude/projects`,
+    while six transcripts were being appended at that moment, and 30
+    consecutive `lsof` polls of one actively written transcript found it open
+    zero times. It opens, writes one line, closes. Independently, gopsutil's
+    `OpenFiles()` answers "not implemented yet" on darwin (19/19 processes), so
+    the route is dead twice over. Windows was never reached.
+  - *Reading the transcript's contents for `cwd`* — **REJECTED, and it was
+    close.** All 300 sampled transcripts record a `cwd` within their first 2–6
+    lines, and gopsutil reads a process's own cwd on macOS with no elevation
+    (19/19), so ruling out a candidate whose directory differs looked safe. It
+    is not: the directory a transcript records is the one the session was
+    *given*, a process's cwd is where the kernel says it *is*, and a live
+    process on this Mac sits in `…/observer-sessions/4811` while the transcript
+    it writes records `…/observer-sessions`. A wrong rule-out removes the
+    transcript a session is actively writing and leaves only stale ones — the
+    very failure this work exists to prevent — for an upside (separating
+    projects) the claim already covers exactly. Implemented, caught by the
+    real-process dry-run, and removed.
+  - *The process environment* — **WORKS**, and is the fix. gopsutil's
+    `Environ()` is also unimplemented on darwin, so `env_darwin.go` reads
+    `KERN_PROCARGS2` directly and `env_linux.go` reads `/proc/<pid>/environ`;
+    both need no elevation for the user's own processes, which is the only case
+    that matters. Windows keeps the block inside the target process's PEB and
+    is not supported, so it keeps the timestamp behaviour.
+- **The pairing window stays at 15 s / 120 s, deliberately.** The real creation
+  lag was measured over 2001 desktop sessions on this Mac: 1972 transcripts
+  appeared within 15 s of their session starting, 11 more within 30 s, and
+  **none at all** between 30 s and 120 s — which says a 30 s window would lose
+  nothing *for desktop sessions*. It is not applied, because those are exactly
+  the sessions that now name their own transcript and never reach the window.
+  The processes that do reach it are the `stream-json` sessions something other
+  than the desktop app started, and they were never in that sample: a live one
+  on this Mac had its candidate transcripts appear 40.7 s and 67.5 s after it
+  started, so a 30 s window would have made it permanently uncollectable.
+  Narrowing on evidence drawn from the wrong population is a guess wearing a
+  measurement's clothes.
+- **How common the inversion actually was.** Of the 18 real session pairs on
+  this Mac launched within 15 s of each other, 3 had their transcripts appear
+  in the opposite order (17%); among pairs sharing a working directory, 3 of 11
+  (27%). Every one of those was same-directory, which is why no cwd rule could
+  have helped. The creation lag ranges from 2.5 s to 14.4 s (p50 4.8 s), so any
+  batch launched seconds apart is inside the regime where the order inverts.
+- All failure modes carry regression tests that assert **which pid** is named
+  (`internal/janitor/pairing_test.go`, `janitor_test.go`, `claim_test.go`). The
   killed/spared counts match correct behaviour in each, so a count-only test
-  cannot catch any of them.
+  cannot catch any of them. `TestPairingNeverKillsAWritingSession` now also
+  generates batches whose transcripts appeared out of launch order, which it
+  previously discarded as out of regime; what remains out of regime is only
+  that among the sessions claiming **nothing**, birth order must still match
+  launch order, because for those nothing but timestamps exists. It also
+  generates batches in which two sessions name one transcript — a run asserts
+  at least 200 of those and at least 200 inverted ones, and reports roughly 275
+  and 740 out of 4000. With the exclusivity rule removed it fails on the first
+  contested batch it reaches.
 
 ---
 
@@ -223,11 +329,12 @@ Notes:
   SIGKILL on POSIX and calls `TerminateProcess` (unconditional, no catchable
   signal) on Windows — both are the non-ignorable kill, matching the Mac `-9`
   behavior (RESEARCHED).
-- Pairing window `PairBefore`/`PairAfter` = 15 s / 120 s (measured transcript
-  creation lag on-box: 4–14 s; the window leaves ~10× headroom without
-  swallowing a neighbor session started minutes apart). The window only decides
-  which pairs are *candidates*; what is done with several candidates is §2.B's
-  no-guessing rule.
+- Pairing window `PairBefore`/`PairAfter` = 15 s / 120 s, and it now applies
+  only to the processes that do not name their own transcript (§2.B). Measured
+  lag over 2001 desktop sessions: p50 4.8 s, p99 14.4 s, none between 30 s and
+  120 s — but a non-desktop `stream-json` session on this Mac lagged 40–68 s, so
+  the window is not narrowed. It only decides which pairs are *candidates*; what
+  is done with several candidates is §2.B's no-guessing rule.
 
 ---
 

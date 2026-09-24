@@ -13,14 +13,17 @@ import (
 // mtime, like a real append-only transcript). macOS birth time only moves
 // DOWN: setting an older mtime drags birth along, and a later Chtimes lifts
 // mtime back while birth stays -- which is exactly how we decouple the two.
-func newTestJanitor(t *testing.T) (*Janitor, func(name string, btime, mtime time.Time) string) {
+// The returned buffer captures the pass log: pairing regressions are only
+// visible in WHICH pid is named, never in the killed/spared counts.
+func newTestJanitor(t *testing.T) (*Janitor, *bytes.Buffer, func(name string, btime, mtime time.Time) string) {
 	t.Helper()
 	root := t.TempDir()
 	proj := filepath.Join(root, "-Users-x-proj")
 	if err := os.MkdirAll(proj, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	j := New(Config{ProjectsDir: root, DryRun: true}, &bytes.Buffer{})
+	buf := &bytes.Buffer{}
+	j := New(Config{ProjectsDir: root, DryRun: true}, buf)
 	mk := func(name string, btime, mtime time.Time) string {
 		p := filepath.Join(proj, name)
 		if err := os.WriteFile(p, []byte("{}"), 0o644); err != nil {
@@ -34,7 +37,7 @@ func newTestJanitor(t *testing.T) (*Janitor, func(name string, btime, mtime time
 		}
 		return p
 	}
-	return j, mk
+	return j, buf, mk
 }
 
 func bgProc(pid int32, createdAt time.Time) procInfo {
@@ -47,7 +50,7 @@ func bgProc(pid int32, createdAt time.Time) procInfo {
 
 // TestFindTranscript verifies the projects/*/<uuid>.jsonl glob.
 func TestFindTranscript(t *testing.T) {
-	j, mk := newTestJanitor(t)
+	j, _, mk := newTestJanitor(t)
 	uuid := "12345678-1234-1234-1234-1234567890ab"
 	now := time.Now()
 	tf := mk(uuid+".jsonl", now, now)
@@ -62,7 +65,7 @@ func TestFindTranscript(t *testing.T) {
 
 // TestStatTimesIdleVsActive verifies mtime drives the idle/active decision.
 func TestStatTimesIdleVsActive(t *testing.T) {
-	_, mk := newTestJanitor(t)
+	_, _, mk := newTestJanitor(t)
 	now := time.Now()
 	old := now.Add(-3 * time.Hour)
 	idle := mk("idle.jsonl", old, old)
@@ -96,7 +99,7 @@ func TestScanDesktopIdleKilledActiveSpared(t *testing.T) {
 	if !birthTimeSupported(t) {
 		t.Skip("no birth-time support on this filesystem")
 	}
-	j, mk := newTestJanitor(t)
+	j, _, mk := newTestJanitor(t)
 	now := time.Now()
 	cutoff := now.Add(-120 * time.Minute)
 
@@ -125,7 +128,7 @@ func TestScanDesktopUnpairableNeverKilled(t *testing.T) {
 	if !birthTimeSupported(t) {
 		t.Skip("no birth-time support on this filesystem")
 	}
-	j, mk := newTestJanitor(t)
+	j, _, mk := newTestJanitor(t)
 	now := time.Now()
 	cutoff := now.Add(-120 * time.Minute)
 
@@ -151,7 +154,7 @@ func TestScanDesktopConflictClosestWins(t *testing.T) {
 	if !birthTimeSupported(t) {
 		t.Skip("no birth-time support on this filesystem")
 	}
-	j, mk := newTestJanitor(t)
+	j, _, mk := newTestJanitor(t)
 	now := time.Now()
 	cutoff := now.Add(-120 * time.Minute)
 
@@ -174,7 +177,7 @@ func TestScanDesktopConflictClosestWins(t *testing.T) {
 // TestScanDesktopIgnoresNonBClass: --resume sessions and non-stream-json
 // processes are not desktop candidates at all.
 func TestScanDesktopIgnoresNonBClass(t *testing.T) {
-	j, mk := newTestJanitor(t)
+	j, _, mk := newTestJanitor(t)
 	now := time.Now()
 	cutoff := now.Add(-120 * time.Minute)
 	old := now.Add(-3 * time.Hour)

@@ -13,7 +13,7 @@ Cross-platform CLI (Go) that kills idle Claude Code session processes (idle > 2h
 
 ## Idle detection — do not regress this
 
-Idleness is judged ONLY by the session transcript's mtime (`~/.claude/projects/*/<id>.jsonl`, updated on every message). Desktop sessions with no id in argv are paired to transcripts by birth time (see janitor.go header and docs/design.md §2.B). Never judge desktop sessions by the app's `local_*.json` mtime — that file is rewritten only on UI events, never during task execution; using it killed active sessions mid-task (2026-07-30 incident). `--resume` appears in both space and `=` forms; handle both.
+Idleness is judged ONLY by the session transcript's mtime (`~/.claude/projects/*/<id>.jsonl`, updated on every message). Desktop sessions with no id in argv are paired to transcripts by birth time (see pairing.go and docs/design.md §2.B). That pairing must stay order-preserving and must skip transcripts a live `--resume` process owns; a smallest-gap-first rule swaps the pairs of sessions launched seconds apart and kills the active one (MEL-231 review, 2026-09-24). Never judge desktop sessions by the app's `local_*.json` mtime — that file is rewritten only on UI events, never during task execution; using it killed active sessions mid-task (2026-07-30 incident). `--resume` appears in both space and `=` forms; handle both.
 
 ## Workflow
 

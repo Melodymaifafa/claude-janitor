@@ -25,9 +25,9 @@ Source: `~/.claude/scripts/claude-session-janitor.sh` (zsh) +
   sessions it is the user's shell).
 - **B — desktop-app background sessions**: `--output-format stream-json`, no
   `--resume`, no uuid in argv. Pair each process to the transcript **born**
-  4–14 s after the process start (window `[start−15 s, start+120 s]`, global
-  greedy match, both sides exclusive); judge idleness by that transcript's
-  mtime. Unpairable processes are never killed.
+  4–14 s after the process start (window `[start−15 s, start+120 s]`,
+  order-preserving and exclusive on both sides — see §2.B); judge idleness by
+  that transcript's mtime. Unpairable processes are never killed.
 - Both classes use **SIGKILL (-9)**, not SIGTERM — the background processes
   ignore TERM.
 - **Superseded (2026-07-30, do not reintroduce):** B-class originally judged
@@ -94,11 +94,38 @@ OS-divergent path at all** — only a way to map process → transcript:
 **Process identification (B):** processes with `--output-format stream-json`
 and no `--resume`. Pair each process to the transcript whose **birth time**
 falls in `[CreateTime−PairBefore, CreateTime+PairAfter]` (defaults 15 s /
-120 s; measured creation lag 4–14 s). Matching is global-greedy by smallest
-gap with both sides exclusive, so sessions started seconds apart each keep
-their own transcript. A process with no pairable transcript (e.g. a re-opened
-session appending its old transcript, whose birth predates the new process) is
-**never killed** — leaking one process beats killing an active session.
+120 s; measured creation lag 4–14 s). A process with no pairable transcript
+(e.g. a re-opened session appending its old transcript, whose birth predates
+the new process) is **never killed** — leaking one process beats killing an
+active session.
+
+**The matching rule is order-preserving, not smallest-gap-first** (corrected
+2026-09-24, MEL-231 R3 review — the first version of this fix shipped the wrong
+rule):
+
+- Processes create their transcripts in the order they start, so the assignment
+  must not cross. Two sessions started Δ apart whose transcripts appear d
+  seconds later give a crossing edge of `|d−Δ|`, which is **smaller** than
+  either true edge `d` whenever `d > Δ > 0`. Smallest-gap-first therefore swaps
+  the pair deterministically for any two sessions launched within ~14 s of each
+  other — normal load when the agent pool starts sessions in batches — and the
+  active session, now holding the dead one's transcript, is killed mid-task.
+- A transcript **owned by a live `--resume` process** is removed from the
+  candidate pool before matching. Otherwise a desktop process can claim a
+  terminal session's transcript when that transcript's birth sits closer to the
+  desktop process's start, and is judged by a stranger's mtime.
+- Implementation (`internal/janitor/pairing.go`): among all non-crossing
+  assignments take one of maximum size, and among those the smallest total gap,
+  so an implausible 100 s pairing loses to a plausible 5 s one. Ties prefer
+  leaving a process unpaired, which is the never-killed branch.
+- **Residual limit, accepted:** when the creation lag varies by more than the
+  launch spacing (14 s for one session, 4 s for one started 5 s later) the birth
+  order itself inverts and no timestamp-only rule can recover the truth. The
+  cost is bounded: a wrongly-spared process, or a kill only when every session
+  in the batch is already past the idle threshold.
+- Both failure modes carry regression tests that assert **which pid** is named
+  (`internal/janitor/pairing_test.go`). The killed/spared counts match correct
+  behaviour in both, so a count-only test cannot catch either.
 
 Where the filesystem exposes no real birth time (some Linux setups: btime
 needs statx and ext4/xfs), B-class pairing is deliberately inert — the pass
@@ -174,7 +201,9 @@ Notes:
   behavior (RESEARCHED).
 - Pairing window `PairBefore`/`PairAfter` = 15 s / 120 s (measured transcript
   creation lag on-box: 4–14 s; the window leaves ~10× headroom without
-  swallowing a neighbor session started minutes apart).
+  swallowing a neighbor session started minutes apart). The window only decides
+  which pairs are *candidates*; which candidate wins is §2.B's order-preserving
+  rule.
 
 ---
 

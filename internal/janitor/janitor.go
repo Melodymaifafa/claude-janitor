@@ -6,8 +6,11 @@
 // Idleness is always judged by the mtime of the session's transcript
 // (~/.claude/projects/*/<id>.jsonl), which every message updates. Terminal
 // sessions name their transcript via --resume <uuid>; desktop background
-// sessions carry no id in argv, so each process is paired to the transcript
-// born right after the process started (measured 4-14s on a real Mac).
+// sessions carry no id in argv, so each process is paired to a transcript born
+// right after it started (measured 4-14s on a real Mac). That pairing must
+// preserve launch order and must not touch a transcript a live terminal
+// session already owns -- see pairing.go, which owns both rules and explains
+// why a smallest-gap-first rule kills active sessions.
 //
 // HISTORY -- do not reintroduce: an earlier design judged desktop sessions by
 // the desktop app's local_<uuid>.json mtime. That file is a UI-event snapshot,
@@ -23,7 +26,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
+	"strings"
 	"time"
 )
 
@@ -114,85 +117,48 @@ func (j *Janitor) scanTerminal(procs []procInfo, now, cutoff time.Time, res *Res
 }
 
 // scanDesktop handles B-class: desktop background sessions (--output-format
-// stream-json, no --resume). Each process is paired to the transcript whose
-// birth time falls within [start-PairBefore, start+PairAfter]; one transcript
-// claims at most one process (smallest gap wins -- a re-opened session's
-// process would otherwise steal a neighbor's transcript). Unpaired processes
-// are NEVER killed: a re-opened session appends its old transcript, whose
-// birth predates the new process, so it cannot pair -- leaking one process
-// beats killing an active session.
+// stream-json, no --resume). Each process is paired to a transcript born inside
+// [start-PairBefore, start+PairAfter] by pairDesktop, which preserves launch
+// order and keeps both sides exclusive. Unpaired processes are NEVER killed: a
+// re-opened session appends its old transcript, whose birth predates the new
+// process, so it cannot pair -- leaking one process beats killing an active
+// session.
 func (j *Janitor) scanDesktop(procs []procInfo, now, cutoff time.Time, res *Result) {
-	trs, noBtime := j.listTranscripts()
-
-	// Collect every (process, transcript) combination whose birth/start gap
-	// falls inside the pairing window, then greedily match globally by
-	// smallest gap with both sides exclusive. Sessions started seconds apart
-	// each still get their own transcript (per-process "closest wins" would
-	// let both pick the same one and orphan the other).
-	type cand struct {
-		p     procInfo
-		gap   time.Duration // |transcript birth - process start|
-		mtime time.Time
-		path  string
-	}
 	var bprocs []procInfo
-	var cands []cand
 	for _, p := range procs {
 		if resumeUUID(p.cmdline) != "" || !hasStreamJSON(p.cmdline) {
 			continue // not a B-class desktop background session
 		}
 		bprocs = append(bprocs, p)
-		for _, tr := range trs {
-			gap := tr.btime.Sub(p.createdAt)
-			if gap < -j.cfg.PairBefore || gap > j.cfg.PairAfter {
-				continue
-			}
-			if gap < 0 {
-				gap = -gap
-			}
-			cands = append(cands, cand{p: p, gap: gap, mtime: tr.mtime, path: tr.path})
-		}
+	}
+	if len(bprocs) == 0 {
+		return
 	}
 
-	if len(bprocs) > 0 && len(trs) == 0 && noBtime > 0 {
+	trs, noBtime := j.listTranscripts(reservedUUIDs(procs))
+	if len(trs) == 0 && noBtime > 0 {
 		// e.g. Linux filesystems without birth-time support: pairing is
 		// impossible, so B-class is deliberately inert rather than guessing.
 		j.logf("transcript birth times unavailable (%d files); desktop sessions left untouched", noBtime)
 	}
 
-	sort.Slice(cands, func(a, b int) bool { return cands[a].gap < cands[b].gap })
-	paired := make(map[int32]cand, len(bprocs))
-	claimed := make(map[string]bool, len(bprocs))
-	for _, c := range cands {
-		if _, ok := paired[c.p.pid]; ok {
-			continue
-		}
-		if claimed[c.path] {
-			continue
-		}
-		paired[c.p.pid] = c
-		claimed[c.path] = true
-	}
-
+	paired := j.pairDesktop(bprocs, trs)
 	for _, p := range bprocs {
 		c, ok := paired[p.pid]
 		if !ok {
-			// A re-opened session appends its old transcript, whose birth
-			// predates the new process, so it cannot pair. Leaking one
-			// process beats killing an active session.
 			res.Skipped++
 			j.logf("skip (unpairable, never killed) PID=%d started=%s",
 				p.pid, p.createdAt.Format("01-02 15:04:05"))
 			continue
 		}
-		if c.mtime.After(cutoff) {
+		if c.tr.mtime.After(cutoff) {
 			res.Spared++
 			continue
 		}
 		killed := killProcessTree(p.pid, j.cfg.DryRun)
 		j.report("desktop", p.pid,
-			fmt.Sprintf("%s pair-gap %ds", filepath.Base(c.path), int(c.gap.Seconds())),
-			now.Sub(c.mtime), killed)
+			fmt.Sprintf("%s pair-gap %ds", filepath.Base(c.tr.path), int(c.gap.Seconds())),
+			now.Sub(c.tr.mtime), killed)
 		res.Killed++
 	}
 }
@@ -204,16 +170,21 @@ type transcriptInfo struct {
 	path  string
 }
 
-// listTranscripts stats every transcript once. Files without a real birth time
-// (Linux fallback) are excluded from pairing -- their btime would equal mtime,
-// which for an append-forever transcript is "now", not creation -- and counted
-// in noBtime so the caller can log the degradation.
-func (j *Janitor) listTranscripts() (trs []transcriptInfo, noBtime int) {
+// listTranscripts stats every transcript once, skipping the ids in reserved
+// (held by a live --resume session). Files without a real birth time (Linux
+// fallback) are excluded from pairing -- their btime would equal mtime, which
+// for an append-forever transcript is "now", not creation -- and counted in
+// noBtime so the caller can log the degradation.
+func (j *Janitor) listTranscripts(reserved map[string]bool) (trs []transcriptInfo, noBtime int) {
 	matches, err := filepath.Glob(filepath.Join(j.cfg.ProjectsDir, "*", "*.jsonl"))
 	if err != nil {
 		return nil, 0
 	}
 	for _, m := range matches {
+		id := strings.ToLower(strings.TrimSuffix(filepath.Base(m), ".jsonl"))
+		if reserved[id] {
+			continue // a live terminal session owns this transcript
+		}
 		ft, err := statTimes(m)
 		if err != nil {
 			continue

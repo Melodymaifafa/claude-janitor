@@ -99,41 +99,43 @@ falls in `[CreateTime−PairBefore, CreateTime+PairAfter]` (defaults 15 s /
 the new process) is **never killed** — leaking one process beats killing an
 active session.
 
-**The matching rule is order-preserving, not smallest-gap-first** (corrected
-2026-09-24, MEL-231 R3 review — the first version of this fix shipped the wrong
-rule):
+**The matching rule is order-preserving and never guesses** (corrected
+2026-09-24, MEL-231 review — the first version of this fix shipped a
+smallest-gap rule, which had three distinct ways to kill an active session, all
+reproduced):
 
-- Processes create their transcripts in the order they start, so the assignment
-  must not cross. Two sessions started Δ apart whose transcripts appear d
-  seconds later give a crossing edge of `|d−Δ|`, which is **smaller** than
-  either true edge `d` whenever `d > Δ > 0`. Smallest-gap-first therefore swaps
-  the pair deterministically for any two sessions launched within ~14 s of each
-  other — normal load when the agent pool starts sessions in batches — and the
-  active session, now holding the dead one's transcript, is killed mid-task.
-- A transcript **owned by a live `--resume` process** is removed from the
-  candidate pool before matching. Otherwise a desktop process can claim a
-  terminal session's transcript when that transcript's birth sits closer to the
-  desktop process's start, and is judged by a stranger's mtime.
-- Implementation (`internal/janitor/pairing.go`): among all non-crossing
-  assignments take one of maximum size, and among those the smallest total gap,
-  so an implausible 100 s pairing loses to a plausible 5 s one. Ties prefer
-  leaving a process unpaired, which is the never-killed branch.
+- **Order.** Processes create their transcripts in the order they start, so the
+  assignment must not cross. Two sessions started Δ apart whose transcripts
+  appear d seconds later give a crossing edge of `|d−Δ|`, which is **smaller**
+  than either true edge `d` whenever `d > Δ > 0`. Smallest-gap-first therefore
+  swaps the pair deterministically for any two sessions launched within ~14 s of
+  each other — normal load when the agent pool starts sessions in batches.
+- **Exclusivity.** A transcript **owned by a live `--resume` process** is removed
+  from the candidate pool before matching. Otherwise a desktop process can claim
+  a terminal session's transcript when that transcript's birth sits closer to the
+  desktop process's start, and is then judged by a stranger's mtime.
+- **No guessing.** Transcripts are never deleted, so a window routinely holds
+  more transcripts than there are live processes: the sessions launched in the
+  same batch that have since exited leave theirs behind forever. Choosing the
+  "most plausible" candidate hands a survivor an orphan's transcript and kills it
+  once that orphan goes stale. So the pairing reports **every** transcript a
+  process could own under some maximum non-crossing assignment, and the process
+  is killed only when **all** of them are stale — idle whichever one is really
+  its own. A process that some maximum assignment leaves out entirely (e.g. two
+  processes and one transcript) has no activity evidence at all and is never
+  killed.
+- Implementation in `internal/janitor/pairing.go`; kill/spare decision in
+  `scanDesktop`. Exact timestamp ties break on pid and path, because `gopsutil`
+  reports process start times in whole milliseconds and a batch can share one.
 - **Residual limit, accepted:** when the creation lag varies by more than the
   launch spacing (14 s for one session, 4 s for one started 5 s later) the birth
-  order itself inverts and no timestamp-only rule can recover the truth. The
-  cost is bounded: a wrongly-spared process, or a kill only when every session
-  in the batch is already past the idle threshold.
-- Both failure modes carry regression tests that assert **which pid** is named
-  (`internal/janitor/pairing_test.go`). The killed/spared counts match correct
-  behaviour in both, so a count-only test cannot catch either.
-
-Where the filesystem exposes no real birth time (some Linux setups: btime
-needs statx and ext4/xfs), B-class pairing is deliberately inert — the pass
-logs the degradation and touches nothing. A-class is unaffected.
-
-**Superseded:** the earlier design reverse-matched the desktop app's
-`local_<uuid>.json` (per-OS paths, `--sessions-dir` override) to processes by
-start time. Killed active sessions mid-task — see §0. Do not reintroduce.
+  order itself inverts, and no timestamp-only rule can recover the pairing.
+  Closing that needs a **direct ownership signal** — an open file handle on the
+  transcript, or the session id recorded inside it — not a better timing rule.
+- All three failure modes carry regression tests that assert **which pid** is
+  named (`internal/janitor/pairing_test.go`, `janitor_test.go`). The
+  killed/spared counts match correct behaviour in each, so a count-only test
+  cannot catch any of them.
 
 ---
 
@@ -202,8 +204,8 @@ Notes:
 - Pairing window `PairBefore`/`PairAfter` = 15 s / 120 s (measured transcript
   creation lag on-box: 4–14 s; the window leaves ~10× headroom without
   swallowing a neighbor session started minutes apart). The window only decides
-  which pairs are *candidates*; which candidate wins is §2.B's order-preserving
-  rule.
+  which pairs are *candidates*; what is done with several candidates is §2.B's
+  no-guessing rule.
 
 ---
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -146,31 +147,97 @@ func TestScanDesktopUnpairableNeverKilled(t *testing.T) {
 	}
 }
 
-// TestScanDesktopConflictClosestWins: two processes inside the pairing window
-// of ONE transcript -- only the closer one claims it; the loser must be
-// skipped, not killed with the same transcript's idle time (the old
-// local-json design double-killed exactly this way).
-func TestScanDesktopConflictClosestWins(t *testing.T) {
+// TestScanDesktopFewerTranscriptsThanProcesses: two processes inside the
+// pairing window of ONE transcript. One of them owns it and the other's
+// transcript is missing from the pool entirely, and nothing says which is which
+// -- so neither may be killed. The earlier "closest gap wins" rule killed the
+// nearer one on that guess, which is how a survivor of a batch launch inherited
+// a dead sibling's transcript.
+func TestScanDesktopFewerTranscriptsThanProcesses(t *testing.T) {
 	if !birthTimeSupported(t) {
 		t.Skip("no birth-time support on this filesystem")
 	}
-	j, _, mk := newTestJanitor(t)
+	j, buf, mk := newTestJanitor(t)
 	now := time.Now()
 	cutoff := now.Add(-120 * time.Minute)
 
 	born := now.Add(-3 * time.Hour)
-	mk("only-sess.jsonl", born, born) // stale -> its true owner dies
+	mk("only-sess.jsonl", born, born) // stale, but whose?
 
 	procs := []procInfo{
-		bgProc(111111, born.Add(-5*time.Second)),   // gap ~5s -> wins the claim
-		bgProc(222222, born.Add(-100*time.Second)), // gap ~100s -> loses, skipped
+		bgProc(111111, born.Add(-5*time.Second)),
+		bgProc(222222, born.Add(-100*time.Second)),
 	}
 
 	var res Result
 	j.scanDesktop(procs, now, cutoff, &res)
 
-	if res.Killed != 1 || res.Skipped != 1 {
-		t.Errorf("got killed=%d skipped=%d, want killed=1 skipped=1", res.Killed, res.Skipped)
+	if res.Killed != 0 || res.Skipped != 2 {
+		t.Errorf("got killed=%d skipped=%d, want killed=0 skipped=2\nlog:\n%s",
+			res.Killed, res.Skipped, buf.String())
+	}
+}
+
+// TestScanDesktopAllCandidatesStaleStillKills: the flip side of the rule above.
+// Transcripts are never deleted, so two sessions that exited leave theirs inside
+// the survivor's window forever. As long as EVERY transcript the survivor could
+// own is stale, it is idle whichever one is really its own -- otherwise a
+// batch-launched session could never be collected again.
+func TestScanDesktopAllCandidatesStaleStillKills(t *testing.T) {
+	if !birthTimeSupported(t) {
+		t.Skip("no birth-time support on this filesystem")
+	}
+	j, buf, mk := newTestJanitor(t)
+	now := time.Now()
+	cutoff := now.Add(-120 * time.Minute)
+	base := now.Add(-4 * time.Hour)
+
+	// Three transcripts from one batch, all silent for 4h; only one process left.
+	mk("aaaaaaaa-9999-9999-9999-999999999991.jsonl", base.Add(9*time.Second), base.Add(30*time.Second))
+	mk("aaaaaaaa-9999-9999-9999-999999999992.jsonl", base.Add(13*time.Second), base.Add(40*time.Second))
+	mk("aaaaaaaa-9999-9999-9999-999999999993.jsonl", base.Add(17*time.Second), base.Add(50*time.Second))
+
+	procs := []procInfo{bgProc(930001, base.Add(8*time.Second))}
+
+	var res Result
+	j.scanDesktop(procs, now, cutoff, &res)
+
+	if res.Killed != 1 {
+		t.Errorf("got killed=%d, want 1 (every candidate transcript is stale)\nlog:\n%s",
+			res.Killed, buf.String())
+	}
+}
+
+// TestScanDesktopOrphanTranscriptSparesSurvivor: same shape, but the survivor is
+// still working. A sibling that exited left a stale transcript nearer to the
+// survivor's start time than the survivor's own; claiming it would kill an
+// active session.
+func TestScanDesktopOrphanTranscriptSparesSurvivor(t *testing.T) {
+	if !birthTimeSupported(t) {
+		t.Skip("no birth-time support on this filesystem")
+	}
+	j, buf, mk := newTestJanitor(t)
+	now := time.Now()
+	cutoff := now.Add(-120 * time.Minute)
+	base := now.Add(-4 * time.Hour)
+
+	// Sibling started at base and exited; its transcript was born at base+10s.
+	mk("bbbbbbbb-8888-8888-8888-888888888881.jsonl", base.Add(10*time.Second), base.Add(25*time.Second))
+	// Survivor started at base+5s; its own transcript is still being appended.
+	mk("bbbbbbbb-8888-8888-8888-888888888882.jsonl", base.Add(15*time.Second), now)
+
+	procs := []procInfo{bgProc(940001, base.Add(5*time.Second))}
+
+	var res Result
+	j.scanDesktop(procs, now, cutoff, &res)
+
+	log := buf.String()
+	t.Logf("killed=%d spared=%d skipped=%d\nlog:\n%s", res.Killed, res.Spared, res.Skipped, log)
+	if strings.Contains(log, "PID=940001") && res.Killed > 0 {
+		t.Errorf("REGRESSION: the ACTIVE survivor (PID=940001) was killed on an exited sibling's transcript")
+	}
+	if res.Killed != 0 {
+		t.Errorf("got killed=%d, want 0", res.Killed)
 	}
 }
 

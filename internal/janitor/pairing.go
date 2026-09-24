@@ -5,141 +5,195 @@ import (
 	"time"
 )
 
-// Desktop (B-class) process -> transcript assignment. This is the one place in
-// the tool where a wrong answer kills a session that is still working, so the
-// rules are spelled out rather than implied.
+// Desktop (B-class) process -> transcript pairing. This is the one place in the
+// tool where a wrong answer kills a session that is still working, so the rules
+// are spelled out rather than implied.
 //
 // A desktop session carries no session id in argv; the only link to its
 // transcript is timing -- the transcript is created a few seconds AFTER the
-// process starts (measured 4-14s on-box). Two properties follow, both
-// load-bearing:
+// process starts (measured 4-14s on-box). Three rules follow, each of which was
+// a live way to kill an active session before it existed (MEL-231 R3/R4 review,
+// every case reproduced):
 //
-//  1. ORDER. Processes create their transcripts in the order they start, so the
-//     assignment must not cross: among the transcripts it can reach, the i-th
-//     process by start time takes the i-th transcript by birth time. Picking
-//     the smallest gap first breaks this. With two sessions started Δ apart
-//     whose transcripts appear d seconds later, the crossing edge |d−Δ| is
-//     smaller than either true edge d whenever d > Δ > 0, so smallest-gap-first
-//     swaps the pair every time -- and the active session, now holding the dead
-//     one's transcript, is killed mid-task (MEL-231 R3 review, reproduced).
+//  1. ORDER. Processes create their transcripts in the order they start, so a
+//     pairing must not cross. Picking the smallest gap first breaks this: with
+//     two sessions started Δ apart whose transcripts appear d seconds later, the
+//     crossing edge |d−Δ| is smaller than either true edge d whenever d > Δ > 0,
+//     so smallest-gap-first swaps them every time, and the active session --
+//     now holding the dead one's transcript -- is killed mid-task.
 //
-//  2. EXCLUSIVITY. A transcript belongs to exactly one process, and one already
-//     owned by a live terminal (--resume) session belongs to no desktop process
-//     at all -- see reservedUUIDs.
+//  2. EXCLUSIVITY. A transcript belongs to exactly one process, and one owned by
+//     a live terminal (--resume) session belongs to no desktop process at all
+//     (see reservedUUIDs).
 //
-// Among all non-crossing assignments we take one of maximum size, so every
-// process the evidence can place gets placed; among those, the one with the
-// smallest total gap, so an implausible 100s pairing loses to a plausible 5s
-// one. A process left unpaired is never killed.
+//  3. NO GUESSING. Transcripts are never deleted, so a window can hold more
+//     transcripts than there are live processes -- the sessions launched in the
+//     same batch that have since exited leave theirs behind. A rule that picks
+//     the "most plausible" candidate then hands a survivor an orphan's
+//     transcript and kills it once the orphan goes stale. So the pairing reports
+//     EVERY transcript a process could own, and a process is killed only when
+//     all of them are stale: idle whichever one is really its own. A process
+//     that some maximum pairing leaves out entirely has no activity evidence at
+//     all and is never killed.
 //
-// Residual limit, by design: when the creation lag d varies more than the
-// launch spacing Δ (e.g. 14s for the first session, 4s for one started 5s
-// later) the birth order itself inverts, and no rule reading only timestamps
-// can recover the truth. Pairing then lands on the wrong transcript of the same
-// batch. The tool accepts this: it can cost one wrongly-spared process, or a
-// kill only when BOTH sessions of the batch are past the idle threshold.
+// Residual limit, by design: when the creation lag d varies by more than the
+// launch spacing Δ (14s for one session, 4s for one started 5s later) the birth
+// order itself inverts, and no rule reading only timestamps can recover the
+// truth -- the pairing lands on the wrong transcript of the same batch. Fixing
+// that needs a direct ownership signal (an open file handle, or the session id
+// inside the transcript), not a better timing rule.
 
-// pairAssignment is the transcript chosen for one process.
+// pairAssignment is one transcript a process could own.
 type pairAssignment struct {
 	tr  transcriptInfo
 	gap time.Duration // |transcript birth − process start|
 }
 
-// pairScore ranks whole assignments: more pairs first, then smaller total gap.
-type pairScore struct {
-	pairs int
-	total time.Duration
-}
-
-func (a pairScore) beats(b pairScore) bool {
-	if a.pairs != b.pairs {
-		return a.pairs > b.pairs
-	}
-	return a.total < b.total
+// pairVerdict is everything the pairing knows about one desktop process.
+// A process is safe to judge only when forced is true: every maximum pairing
+// gives it one of candidates, so it certainly owns one of them.
+type pairVerdict struct {
+	forced     bool
+	candidates []pairAssignment
 }
 
 // noPair marks a (process, transcript) combination outside the pairing window.
 const noPair = time.Duration(-1)
 
-// pairDesktop returns the chosen transcript per process pid. Processes absent
-// from the result are unpairable and must never be killed.
-func (j *Janitor) pairDesktop(procs []procInfo, trs []transcriptInfo) map[int32]pairAssignment {
-	out := make(map[int32]pairAssignment, len(procs))
-	if len(procs) == 0 || len(trs) == 0 {
+// inPairWindow reports whether a transcript was born close enough to a
+// process's start to be a candidate for it at all: birth must fall in
+// [start-PairBefore, start+PairAfter].
+func (j *Janitor) inPairWindow(tr transcriptInfo, p procInfo) bool {
+	d := tr.btime.Sub(p.createdAt)
+	return d >= -j.cfg.PairBefore && d <= j.cfg.PairAfter
+}
+
+// pairDesktop returns one verdict per desktop process, keyed by pid.
+func (j *Janitor) pairDesktop(procs []procInfo, trs []transcriptInfo) map[int32]pairVerdict {
+	out := make(map[int32]pairVerdict, len(procs))
+	if len(procs) == 0 {
 		return out
 	}
 
 	// Sorting both sides by time makes "index-monotone" mean "order-preserving",
-	// which is what the dynamic program below enforces.
+	// which is what the two passes below enforce. pid and path break exact ties
+	// so the same machine state always reaches the same answer; gopsutil reports
+	// start times in whole milliseconds, so a batch really can share one.
 	ps := make([]procInfo, len(procs))
 	copy(ps, procs)
-	sort.Slice(ps, func(a, b int) bool { return ps[a].createdAt.Before(ps[b].createdAt) })
-	ts := make([]transcriptInfo, len(trs))
-	copy(ts, trs)
-	sort.Slice(ts, func(a, b int) bool { return ts[a].btime.Before(ts[b].btime) })
+	sort.Slice(ps, func(a, b int) bool {
+		if !ps[a].createdAt.Equal(ps[b].createdAt) {
+			return ps[a].createdAt.Before(ps[b].createdAt)
+		}
+		return ps[a].pid < ps[b].pid
+	})
+
+	// Drop transcripts outside every process's window. They can never be paired,
+	// so this changes no answer, and it keeps the tables below sized by the
+	// handful of live sessions rather than by the thousands of transcripts a
+	// long-running machine accumulates.
+	ts := make([]transcriptInfo, 0, len(ps)+1)
+	for _, tr := range trs {
+		for _, p := range ps {
+			if j.inPairWindow(tr, p) {
+				ts = append(ts, tr)
+				break
+			}
+		}
+	}
+	sort.Slice(ts, func(a, b int) bool {
+		if !ts[a].btime.Equal(ts[b].btime) {
+			return ts[a].btime.Before(ts[b].btime)
+		}
+		return ts[a].path < ts[b].path
+	})
 
 	n, m := len(ps), len(ts)
+	for _, p := range ps {
+		out[p.pid] = pairVerdict{}
+	}
+	if m == 0 {
+		return out
+	}
+
 	gap := make([][]time.Duration, n)
 	for i := range ps {
 		gap[i] = make([]time.Duration, m)
 		for k := range ts {
 			gap[i][k] = noPair
-			d := ts[k].btime.Sub(ps[i].createdAt)
-			if d < -j.cfg.PairBefore || d > j.cfg.PairAfter {
-				continue // outside the window: not a candidate at all
+			if !j.inPairWindow(ts[k], ps[i]) {
+				continue // not a candidate at all
 			}
-			if d < 0 {
-				d = -d
+			if d := ts[k].btime.Sub(ps[i].createdAt); d < 0 {
+				gap[i][k] = -d
+			} else {
+				gap[i][k] = d
 			}
-			gap[i][k] = d
 		}
 	}
 
-	// dp[i][k] = best score over the first i processes and first k transcripts.
-	// Both indices only ever move forward, so no chosen pair can cross another.
-	dp := make([][]pairScore, n+1)
-	from := make([][]byte, n+1) // 'p' pair, 'i' leave process unpaired, 'k' leave transcript unused
+	// pre[i][k] is the largest non-crossing pairing of the first i processes with
+	// the first k transcripts; suf[i][k] the same for processes i.. against
+	// transcripts k.. Both indices only move forward, which is what forbids a
+	// crossing. K is the size of a maximum pairing.
+	pre := make([][]int, n+1)
+	suf := make([][]int, n+1)
 	for i := 0; i <= n; i++ {
-		dp[i] = make([]pairScore, m+1)
-		from[i] = make([]byte, m+1)
+		pre[i] = make([]int, m+1)
+		suf[i] = make([]int, m+1)
 	}
 	for i := 1; i <= n; i++ {
 		for k := 1; k <= m; k++ {
-			// Ties keep the earlier branch, so an equally-good assignment that
-			// pairs nothing wins over one that does: unpaired is never killed.
-			best, choice := dp[i-1][k], byte('i')
-			if dp[i][k-1].beats(best) {
-				best, choice = dp[i][k-1], 'k'
+			best := pre[i-1][k]
+			if pre[i][k-1] > best {
+				best = pre[i][k-1]
 			}
-			if g := gap[i-1][k-1]; g != noPair {
-				cand := pairScore{pairs: dp[i-1][k-1].pairs + 1, total: dp[i-1][k-1].total + g}
-				if cand.beats(best) {
-					best, choice = cand, 'p'
-				}
+			if gap[i-1][k-1] != noPair && pre[i-1][k-1]+1 > best {
+				best = pre[i-1][k-1] + 1
 			}
-			dp[i][k], from[i][k] = best, choice
+			pre[i][k] = best
 		}
 	}
-
-	for i, k := n, m; i > 0 && k > 0; {
-		switch from[i][k] {
-		case 'p':
-			out[ps[i-1].pid] = pairAssignment{tr: ts[k-1], gap: gap[i-1][k-1]}
-			i--
-			k--
-		case 'k':
-			k--
-		default:
-			i--
+	for i := n - 1; i >= 0; i-- {
+		for k := m - 1; k >= 0; k-- {
+			best := suf[i+1][k]
+			if suf[i][k+1] > best {
+				best = suf[i][k+1]
+			}
+			if gap[i][k] != noPair && suf[i+1][k+1]+1 > best {
+				best = suf[i+1][k+1] + 1
+			}
+			suf[i][k] = best
 		}
+	}
+	total := pre[n][m]
+
+	for i := 0; i < n; i++ {
+		v := pairVerdict{forced: total > 0}
+		for k := 0; k < m; k++ {
+			// Keep transcript k for process i when some maximum pairing uses that
+			// very pair: everything before it plus this pair plus everything after
+			// it still adds up to a maximum.
+			if gap[i][k] != noPair && pre[i][k]+1+suf[i+1][k+1] == total {
+				v.candidates = append(v.candidates, pairAssignment{tr: ts[k], gap: gap[i][k]})
+			}
+		}
+		// A maximum pairing that skips this process entirely means the evidence
+		// never places it, so nothing may be concluded about it.
+		for k := 0; k <= m; k++ {
+			if pre[i][k]+suf[i+1][k] == total {
+				v.forced = false
+				break
+			}
+		}
+		out[ps[i].pid] = v
 	}
 	return out
 }
 
 // reservedUUIDs collects the transcript ids named by live --resume processes.
 // Those transcripts have a known owner, so no desktop process may adopt one:
-// doing so judges an active desktop session by a stranger's mtime and kills it
-// (MEL-231 R3 review, reproduced).
+// doing so judges an active desktop session by a stranger's mtime and kills it.
 func reservedUUIDs(procs []procInfo) map[string]bool {
 	held := make(map[string]bool)
 	for _, p := range procs {

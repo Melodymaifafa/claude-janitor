@@ -117,12 +117,12 @@ func (j *Janitor) scanTerminal(procs []procInfo, now, cutoff time.Time, res *Res
 }
 
 // scanDesktop handles B-class: desktop background sessions (--output-format
-// stream-json, no --resume). Each process is paired to a transcript born inside
-// [start-PairBefore, start+PairAfter] by pairDesktop, which preserves launch
-// order and keeps both sides exclusive. Unpaired processes are NEVER killed: a
-// re-opened session appends its old transcript, whose birth predates the new
-// process, so it cannot pair -- leaking one process beats killing an active
-// session.
+// stream-json, no --resume). pairDesktop reports every transcript each process
+// could own; the process is killed only when all of them are stale, so it is
+// idle whichever one is really its own. A process the pairing cannot place is
+// NEVER killed -- a re-opened session appends its old transcript, whose birth
+// predates the new process, so it cannot pair at all, and leaking one process
+// beats killing an active session.
 func (j *Janitor) scanDesktop(procs []procInfo, now, cutoff time.Time, res *Result) {
 	var bprocs []procInfo
 	for _, p := range procs {
@@ -144,23 +144,46 @@ func (j *Janitor) scanDesktop(procs []procInfo, now, cutoff time.Time, res *Resu
 
 	paired := j.pairDesktop(bprocs, trs)
 	for _, p := range bprocs {
-		c, ok := paired[p.pid]
-		if !ok {
+		v := paired[p.pid]
+		if !v.forced || len(v.candidates) == 0 {
 			res.Skipped++
-			j.logf("skip (unpairable, never killed) PID=%d started=%s",
-				p.pid, p.createdAt.Format("01-02 15:04:05"))
+			j.logf("skip (%s, never killed) PID=%d started=%s",
+				unpairableReason(v), p.pid, p.createdAt.Format("01-02 15:04:05"))
 			continue
 		}
-		if c.tr.mtime.After(cutoff) {
+		// The newest candidate is the conservative one: if ANY transcript this
+		// process might own was just written, it may be the active session.
+		newest := v.candidates[0]
+		for _, c := range v.candidates[1:] {
+			if c.tr.mtime.After(newest.tr.mtime) {
+				newest = c
+			}
+		}
+		if newest.tr.mtime.After(cutoff) {
 			res.Spared++
 			continue
 		}
 		killed := killProcessTree(p.pid, j.cfg.DryRun)
-		j.report("desktop", p.pid,
-			fmt.Sprintf("%s pair-gap %ds", filepath.Base(c.tr.path), int(c.gap.Seconds())),
-			now.Sub(c.tr.mtime), killed)
+		j.report("desktop", p.pid, pairRef(v, newest), now.Sub(newest.tr.mtime), killed)
 		res.Killed++
 	}
+}
+
+// unpairableReason names why a process was left alone, so the ordinary
+// re-opened-session case can be told apart from an ambiguous window.
+func unpairableReason(v pairVerdict) string {
+	if len(v.candidates) == 0 {
+		return "unpairable"
+	}
+	return "owner not certain"
+}
+
+// pairRef describes what the kill decision was based on.
+func pairRef(v pairVerdict, newest pairAssignment) string {
+	if len(v.candidates) == 1 {
+		return fmt.Sprintf("%s pair-gap %ds", filepath.Base(newest.tr.path), int(newest.gap.Seconds()))
+	}
+	return fmt.Sprintf("%d candidates, all stale", len(v.candidates))
 }
 
 // transcriptInfo is one projects/*/*.jsonl candidate for B-class pairing.

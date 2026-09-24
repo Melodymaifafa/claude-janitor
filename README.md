@@ -17,7 +17,8 @@ by the same signal: the mtime of the session's transcript
 - **Terminal `--resume` sessions** — the transcript uuid is in the command line.
 - **Desktop-app background sessions** — no uuid in the command line, so each
   process is paired to the transcript born just after it started (measured 4–14 s
-  on a real Mac). A process with no pairable transcript is left alone rather than
+  on a real Mac). When several transcripts could be its own, it is killed only if
+  every one of them is stale; when none can be, it is left alone rather than
   killed on a guess. These sessions ignore `SIGTERM`, so they get `SIGKILL`.
 
 Active sessions have a fresh transcript mtime, so they are never touched. Session

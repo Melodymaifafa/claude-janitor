@@ -263,16 +263,30 @@ func TestScanDesktopIgnoresNonBClass(t *testing.T) {
 	}
 }
 
-// birthTimeSupported probes whether this filesystem exposes real birth times.
+// birthTimeSupported probes whether this filesystem BOTH exposes a real birth
+// time and lets os.Chtimes move it, which is what the file-based pairing
+// fixtures need. macOS drags birth time down with mtime; Linux statx reports a
+// real creation time that Chtimes cannot touch, so there the fixtures cannot be
+// aged and these tests skip. The pairing logic itself is covered on every OS by
+// TestPairingNeverKillsAWritingSession, which builds its inputs in memory.
 func birthTimeSupported(t *testing.T) bool {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "probe")
 	if err := os.WriteFile(p, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	want := time.Now().Add(-3 * time.Hour)
+	if err := os.Chtimes(p, want, want); err != nil {
+		t.Fatal(err)
+	}
 	ft, err := statTimes(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return ft.hasBtime
+	if !ft.hasBtime {
+		return false
+	}
+	// Within a minute of the requested time means Chtimes really moved birth.
+	off := ft.btime.Sub(want)
+	return off > -time.Minute && off < time.Minute
 }

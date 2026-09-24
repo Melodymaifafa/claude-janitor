@@ -1,6 +1,9 @@
 package janitor
 
 import (
+	"bytes"
+	"fmt"
+	"math/rand"
 	"strings"
 	"testing"
 	"time"
@@ -178,4 +181,89 @@ func TestReservedUUIDsBothResumeForms(t *testing.T) {
 	if len(held) != 2 {
 		t.Errorf("a desktop process must reserve nothing, got %v", held)
 	}
+}
+
+// TestPairingNeverKillsAWritingSession is the whole point of the ticket, as a
+// property rather than a case list: across thousands of random session batches
+// -- random launch spacing, random transcript creation lag, random survivors,
+// and the transcripts of exited siblings left lying around as the real machine
+// leaves them -- a process whose OWN transcript was just written must never be
+// selected for kill.
+//
+// Generation stays inside the regime the design supports: batches where the
+// transcripts were born in the same order the processes started. Outside it the
+// birth order itself lies, and pairing.go documents that no timestamp-only rule
+// can recover the truth there.
+func TestPairingNeverKillsAWritingSession(t *testing.T) {
+	rng := rand.New(rand.NewSource(20260924))
+	j := New(Config{ProjectsDir: t.TempDir(), DryRun: true}, &bytes.Buffer{})
+	now := time.Now()
+	cutoff := now.Add(-120 * time.Minute)
+	base := now.Add(-4 * time.Hour)
+
+	checked := 0
+	for iter := 0; iter < 4000; iter++ {
+		sessions := 2 + rng.Intn(4)
+
+		// Launch the batch, each session's transcript born after its own start.
+		starts := make([]time.Time, sessions)
+		births := make([]time.Time, sessions)
+		at := base
+		for i := 0; i < sessions; i++ {
+			at = at.Add(time.Duration(1+rng.Intn(20)) * time.Second)
+			starts[i] = at
+			births[i] = at.Add(time.Duration(4+rng.Intn(11)) * time.Second)
+		}
+		ordered := true
+		for i := 1; i < sessions; i++ {
+			if !births[i].After(births[i-1]) {
+				ordered = false
+			}
+		}
+		if !ordered {
+			continue // outside the supported regime; see the doc comment
+		}
+
+		// Some sessions are still writing; some exited and left a stale transcript.
+		alive := make([]bool, sessions)
+		writing := make([]bool, sessions)
+		var procs []procInfo
+		var trs []transcriptInfo
+		for i := 0; i < sessions; i++ {
+			alive[i] = rng.Intn(2) == 0
+			writing[i] = alive[i] && rng.Intn(2) == 0
+			mtime := births[i].Add(time.Duration(rng.Intn(60)) * time.Second) // long stale
+			if writing[i] {
+				mtime = now.Add(-time.Duration(rng.Intn(30)) * time.Second)
+			}
+			trs = append(trs, transcriptInfo{
+				btime: births[i],
+				mtime: mtime,
+				path:  fmt.Sprintf("/p/sess-%02d.jsonl", i),
+			})
+			if alive[i] {
+				procs = append(procs, bgProc(int32(1000+i), starts[i]))
+			}
+		}
+		if len(procs) == 0 {
+			continue
+		}
+
+		verdicts := j.pairDesktop(procs, trs)
+		for i := 0; i < sessions; i++ {
+			if !writing[i] {
+				continue
+			}
+			checked++
+			c, ok := verdicts[int32(1000+i)].decisive()
+			if ok && !c.tr.mtime.After(cutoff) {
+				t.Fatalf("iter %d: session %d is still writing but was judged idle\nstarts=%v\nbirths=%v\nalive=%v writing=%v\nchosen=%s mtime=%v",
+					iter, i, starts, births, alive, writing, c.tr.path, c.tr.mtime)
+			}
+		}
+	}
+	if checked < 500 {
+		t.Fatalf("only %d active sessions exercised; the generator is not covering the case", checked)
+	}
+	t.Logf("checked %d active sessions across random batches", checked)
 }

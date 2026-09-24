@@ -8,9 +8,10 @@
 // sessions name their transcript via --resume <uuid>; desktop background
 // sessions carry no id in argv, so each process is paired to a transcript born
 // right after it started (measured 4-14s on a real Mac). That pairing must
-// preserve launch order and must not touch a transcript a live terminal
-// session already owns -- see pairing.go, which owns both rules and explains
-// why a smallest-gap-first rule kills active sessions.
+// preserve launch order, must not touch a transcript a live terminal session
+// already owns, and must never guess between several possible transcripts --
+// see pairing.go, which owns all three rules and explains how each of them,
+// when missing, killed an active session.
 //
 // HISTORY -- do not reintroduce: an earlier design judged desktop sessions by
 // the desktop app's local_<uuid>.json mtime. That file is a UI-event snapshot,
@@ -145,19 +146,12 @@ func (j *Janitor) scanDesktop(procs []procInfo, now, cutoff time.Time, res *Resu
 	paired := j.pairDesktop(bprocs, trs)
 	for _, p := range bprocs {
 		v := paired[p.pid]
-		if !v.forced || len(v.candidates) == 0 {
+		newest, ok := v.decisive()
+		if !ok {
 			res.Skipped++
 			j.logf("skip (%s, never killed) PID=%d started=%s",
 				unpairableReason(v), p.pid, p.createdAt.Format("01-02 15:04:05"))
 			continue
-		}
-		// The newest candidate is the conservative one: if ANY transcript this
-		// process might own was just written, it may be the active session.
-		newest := v.candidates[0]
-		for _, c := range v.candidates[1:] {
-			if c.tr.mtime.After(newest.tr.mtime) {
-				newest = c
-			}
 		}
 		if newest.tr.mtime.After(cutoff) {
 			res.Spared++

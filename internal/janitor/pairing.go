@@ -36,12 +36,27 @@ import (
 //     that some maximum pairing leaves out entirely has no activity evidence at
 //     all and is never killed.
 //
-// Residual limit, by design: when the creation lag d varies by more than the
-// launch spacing Δ (14s for one session, 4s for one started 5s later) the birth
-// order itself inverts, and no rule reading only timestamps can recover the
-// truth -- the pairing lands on the wrong transcript of the same batch. Fixing
-// that needs a direct ownership signal (an open file handle, or the session id
-// inside the transcript), not a better timing rule.
+// TWO RESIDUAL LIMITS, both needing information this file does not have. Closing
+// either needs a direct ownership signal -- an open file handle on the
+// transcript, or the session id recorded inside it -- not a better timing rule.
+// Tracked as a follow-up; see docs/design.md §2.B.
+//
+//   - Inverted birth order. When the creation lag d varies by more than the
+//     launch spacing Δ (14s for one session, 4s for one started 5s later) the
+//     birth order itself inverts, so the pairing lands on the wrong transcript of
+//     the same batch.
+//
+//   - A re-opened session with an orphan in its window. A re-opened session
+//     appends its ORIGINAL transcript, whose birth predates the new process, so
+//     that transcript is out of window and cannot be a candidate. If a sibling
+//     that exited left exactly one stale transcript born inside the window, this
+//     code sees one process, one candidate, and treats it as certain. The data is
+//     identical to the ordinary case of a single desktop session whose own
+//     transcript went stale -- which is the case B-class cleanup exists for -- so
+//     refusing to kill on one candidate would not make the tool safer, it would
+//     make it do nothing. Reaching this needs a sibling transcript created within
+//     ~2 minutes of the re-open that then went silent for the whole idle
+//     threshold while the re-opened session kept working.
 
 // pairAssignment is one transcript a process could own.
 type pairAssignment struct {
@@ -55,6 +70,24 @@ type pairAssignment struct {
 type pairVerdict struct {
 	forced     bool
 	candidates []pairAssignment
+}
+
+// decisive returns the transcript whose mtime the kill decision must use -- the
+// NEWEST candidate, because if any transcript this process might own was just
+// written, this may be the session that wrote it. ok is false when nothing may
+// be concluded: no candidate at all, or some maximum pairing leaves the process
+// out, meaning the evidence never places it.
+func (v pairVerdict) decisive() (pairAssignment, bool) {
+	if !v.forced || len(v.candidates) == 0 {
+		return pairAssignment{}, false
+	}
+	newest := v.candidates[0]
+	for _, c := range v.candidates[1:] {
+		if c.tr.mtime.After(newest.tr.mtime) {
+			newest = c
+		}
+	}
+	return newest, true
 }
 
 // noPair marks a (process, transcript) combination outside the pairing window.

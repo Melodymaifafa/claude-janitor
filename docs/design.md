@@ -127,11 +127,24 @@ reproduced):
 - Implementation in `internal/janitor/pairing.go`; kill/spare decision in
   `scanDesktop`. Exact timestamp ties break on pid and path, because `gopsutil`
   reports process start times in whole milliseconds and a batch can share one.
-- **Residual limit, accepted:** when the creation lag varies by more than the
-  launch spacing (14 s for one session, 4 s for one started 5 s later) the birth
-  order itself inverts, and no timestamp-only rule can recover the pairing.
-  Closing that needs a **direct ownership signal** — an open file handle on the
-  transcript, or the session id recorded inside it — not a better timing rule.
+- **Two residual limits, accepted.** Both need information timestamps do not
+  carry; closing either needs a **direct ownership signal** — an open file handle
+  on the transcript, or the session id recorded inside it — not a better timing
+  rule.
+  1. *Inverted birth order.* When the creation lag varies by more than the launch
+     spacing (14 s for one session, 4 s for one started 5 s later) the birth order
+     itself inverts, so the pairing lands on the wrong transcript of the batch.
+  2. *A re-opened session with an orphan in its window.* A re-opened session
+     appends its original transcript, whose birth predates the new process, so it
+     is out of window and cannot be a candidate. If a sibling that exited left
+     exactly one stale transcript born inside the window, the pass sees one
+     process and one candidate and treats it as certain. That data is
+     indistinguishable from the ordinary case of a lone desktop session whose own
+     transcript went stale — the case B-class cleanup exists for — so refusing to
+     kill on a single candidate would not make the tool safer, it would make it
+     inert. Reaching this needs a sibling transcript created within ~2 minutes of
+     the re-open that then stayed silent for the whole idle threshold while the
+     re-opened session kept working.
 - All three failure modes carry regression tests that assert **which pid** is
   named (`internal/janitor/pairing_test.go`, `janitor_test.go`). The
   killed/spared counts match correct behaviour in each, so a count-only test

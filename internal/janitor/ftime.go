@@ -22,7 +22,7 @@ func statTimes(path string) (fileTimes, error) {
 		return fileTimes{}, err
 	}
 	mt := fi.ModTime()
-	bt := birthTime(fi) // per-OS; zero if unavailable
+	bt := birthTime(path, fi) // per-OS; zero if unavailable
 	if bt.IsZero() {
 		bt = mt
 	}

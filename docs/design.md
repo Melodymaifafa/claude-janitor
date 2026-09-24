@@ -166,14 +166,34 @@ Logic is unchanged from the Mac script; only the syscalls differ:
 
 ---
 
-## Open items for implementation (not blockers)
+## Open items for implementation — settled 2026-09-24 (MEL-98)
 
-1. Confirm Linux `~/.config/Claude/claude-code-sessions/` layout on a real Linux box.
-2. Confirm Windows native MSIX desktop session path (`Claude_pzs8sxrjxfjjc` package id may change by version).
-3. Confirm Linux birthtime availability per filesystem; mtime fallback covers the gap.
-
-None block the language/path/Windows decisions above — they are on-box
-verifications for the slice that implements B-class on each OS.
+1. **Linux `~/.config/Claude/claude-code-sessions/` — CONFIRMED.** Read out of
+   the shipped `claude-desktop` 2.7032.0 arm64 package (Anthropic's apt
+   repository; the Linux desktop app went to public beta on 2026-06-30). Its
+   GNOME search provider builds the path as
+   `[CLAUDE_USER_DATA_DIR || glib user_config_dir, "Claude", "claude-code-sessions", account, org]`
+   and names files with the `local_` prefix — the same two-level nesting and
+   prefix as macOS. `glib user_config_dir` is `$XDG_CONFIG_HOME` when set and
+   `~/.config` otherwise, which is what `paths_linux.go` already does.
+   Not honoured by the janitor: the app's own `CLAUDE_USER_DATA_DIR` override.
+   A user who sets it must pass `--sessions-dir`.
+2. **Windows MSIX package id — no code change; do not add a glob.** The
+   `claude-code-sessions` lookup is deleted outright by the transcript-pairing
+   fix (branch `users/melody/transcript-mtime-pairing`, 2026-07-30), which
+   pairs desktop sessions against `~/.claude/projects` transcripts on every OS.
+   Hardening a path that is on its way out would re-entrench the codepath that
+   §0 says must not be reintroduced. Until that branch lands, a wrong package
+   id costs nothing: a missing B-class root logs one line and skips
+   (verified on Linux 2026-09-24; the skip lives in the shared `scanDesktop`,
+   so it is not OS-specific).
+3. **Linux birthtime — implemented, was a real gap.** `ftime_linux.go` now
+   reads `STATX_BTIME` via `statx(2)`. Verified on Linux 6.8/aarch64: ext4
+   (256-byte inodes), tmpfs and virtiofs all answer, and the birth time stays
+   put while an append moves mtime. ext4 formatted with 128-byte inodes answers
+   nothing — `birthTime` returns zero there and the caller degrades, suite
+   still green. This matters more after the transcript-pairing fix, where a
+   missing birth time turns B-class inert rather than merely approximate.
 
 ---
 

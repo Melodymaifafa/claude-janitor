@@ -9,7 +9,7 @@ import (
 )
 
 // birthTime reads CreationTime on Windows (natively available; design.md §5).
-func birthTime(fi os.FileInfo) time.Time {
+func birthTime(_ string, fi os.FileInfo) time.Time {
 	st, ok := fi.Sys().(*syscall.Win32FileAttributeData)
 	if !ok {
 		return time.Time{}

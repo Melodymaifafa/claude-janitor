@@ -41,7 +41,7 @@ type Config struct {
 	// SessionsDir overrides where the desktop app keeps its per-session records,
 	// which turn a process's claimed host session id into a transcript id (see
 	// claim.go). Empty or absent means claims do not resolve and the desktop
-	// scan degrades to the working-directory filter plus the timestamp window.
+	// scan degrades to the timestamp window alone.
 	SessionsDir string
 }
 

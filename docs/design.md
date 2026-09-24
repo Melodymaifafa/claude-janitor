@@ -96,15 +96,45 @@ transcript:
 and no `--resume`. Each such process is resolved to its transcript in two
 tiers, evidence first (MEL-237):
 
-1. **The session's own claim — exact, and no timestamp in it.** A desktop
-   session process carries `CLAUDE_CODE_HOST_SESSION_ID` in its environment:
-   the desktop app's id for that session. The app's record of that session
+1. **The session's own claim, when it is the only one — exact, and no
+   timestamp in it.** A desktop session process carries
+   `CLAUDE_CODE_HOST_SESSION_ID` in its environment: the desktop app's id for
+   that session. The app's record of that session
    (`claude-code-sessions/*/*/<hostId>.json`) states, in `cliSessionId`, which
    transcript the session writes. Chained, that names the transcript exactly.
    A claimed transcript is also withdrawn from the candidate pool, so no other
    process can be paired to it — which fixes the neighbours of a claiming
    process even when they claim nothing themselves. Implemented in
    `internal/janitor/claim.go`.
+
+   **Exclusivity is part of the evidence** (MEL-237 review, 2026-09-24). An
+   environment is copied into every child process, so a program a desktop
+   session started carries that session's id, and a session IT starts names the
+   parent's transcript as its own. Measured on this Mac: one host session id
+   carried by 24 live processes, another by 10, another by 5. Two live
+   processes naming one transcript therefore happens, and it means one thing —
+   the pass cannot tell which of them owns it. Marking both certain owners
+   judges the one really writing a *different* transcript by the shared one's
+   silence and kills it mid-task, which is this ticket's own failure mode
+   re-entering through its fix. So **a contested transcript decides nobody**:
+   every claimant is left alone and none of them falls through to tier 2
+   either, because the transcript one of them is really writing has already
+   left the pool. Reproduced on real processes against the real binary: the
+   unfixed build printed `would kill` for both, the fixed build skips both.
+   *Boundary:* when the claimant that really owns the transcript has already
+   exited, a lone inheritor is the only namer left and is judged on the
+   inherited transcript. Nothing separates them — inheritance copies the whole
+   environment, so no variable distinguishes an inherited claim from an own
+   one, and another live namer is the only evidence there is.
+   **A claim needs no creation time.** Listing the transcripts once dropped
+   every file whose birth time the OS would not report (Linux filesystems
+   without `statx` support) before the id lookup was built, so on those systems
+   a session that named its own transcript was told the pass could not read it
+   and the direct-evidence route went dark — safe, but the fix did not exist
+   there. Those files are now listed and marked unpairable: the claim reads
+   mtime, which every filesystem reports, and only the timestamp window below
+   needs a real creation time (MEL-237 review, 2026-09-24).
+
 2. **The birth-time window, unchanged, for everything that claims nothing.**
    Pair each remaining process to the transcripts whose **birth time** falls in
    `[CreateTime−PairBefore, CreateTime+PairAfter]` (defaults 15 s / 120 s),
@@ -172,7 +202,10 @@ reproduced):
   by regression tests built on real processes and real files
   (`internal/janitor/claim_test.go`), each asserting that the timestamp-only
   path kills the session that is actively writing and that the claim path does
-  not.
+  not. The two holes the claim itself opened — a contested transcript, and a
+  filesystem with no creation time — carry their own tests in the same file,
+  each with a "before" arm that reproduces the old behaviour on the same
+  fixture so neither test can pass against itself.
 - **What was measured to get there, on this Mac, 2026-09-24.** The two routes
   the ticket proposed were tested before anything was written:
   - *An open file handle on the transcript* — **DEAD**. Claude Code does not
@@ -226,7 +259,11 @@ reproduced):
   generates batches whose transcripts appeared out of launch order, which it
   previously discarded as out of regime; what remains out of regime is only
   that among the sessions claiming **nothing**, birth order must still match
-  launch order, because for those nothing but timestamps exists.
+  launch order, because for those nothing but timestamps exists. It also
+  generates batches in which two sessions name one transcript — a run asserts
+  at least 200 of those and at least 200 inverted ones, and reports roughly 275
+  and 740 out of 4000. With the exclusivity rule removed it fails on the first
+  contested batch it reaches.
 
 ---
 

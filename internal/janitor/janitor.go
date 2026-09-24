@@ -52,6 +52,12 @@ type Janitor struct {
 	// is a field so tests can drive the decision logic without spawning
 	// processes -- the real implementation has its own tests against real ones.
 	claim func(procInfo) (string, bool)
+
+	// stat reads a session file's timestamps. A field for one reason: no
+	// filesystem on this Mac can produce a file without a birth time, so the
+	// only way to test what the tool does on the Linux filesystems that cannot
+	// report one is to let a test answer the way they do.
+	stat func(string) (fileTimes, error)
 }
 
 // New builds a Janitor, filling unset knobs with defaults.
@@ -75,7 +81,7 @@ func New(cfg Config, out io.Writer) *Janitor {
 	if out == nil {
 		out = os.Stdout
 	}
-	j := &Janitor{cfg: cfg, out: out, now: time.Now}
+	j := &Janitor{cfg: cfg, out: out, now: time.Now, stat: statTimes}
 	j.claim = j.claimedSessionID
 	return j
 }
@@ -120,7 +126,7 @@ func (j *Janitor) scanTerminal(procs []procInfo, now, cutoff time.Time, res *Res
 			res.Skipped++
 			continue
 		}
-		ft, err := statTimes(tf)
+		ft, err := j.stat(tf)
 		if err != nil {
 			res.Skipped++
 			continue
@@ -147,20 +153,38 @@ type desktopDecision struct {
 // decideDesktop resolves every desktop process to the transcript whose mtime
 // decides its fate, in two tiers of decreasing evidence.
 //
-//  1. THE PROCESS'S OWN CLAIM. It names its transcript through its environment
-//     and the desktop app's record of that session (claim.go). Exact, with no
-//     timestamp in the chain, so it is immune to both failure modes timestamps
-//     have: a batch whose transcripts appeared out of order, and a dead
-//     sibling's transcript sitting in a re-opened session's window. A claimed
-//     transcript is also withdrawn from the pool, so no other process can be
-//     paired to it -- which repairs the neighbours of a claiming process even
-//     when they claim nothing themselves.
+//  1. THE PROCESS'S OWN CLAIM, WHEN IT IS THE ONLY ONE. A process names its
+//     transcript through its environment and the desktop app's record of that
+//     session (claim.go). Exact, with no timestamp in the chain, so it is
+//     immune to both failure modes timestamps have: a batch whose transcripts
+//     appeared out of order, and a dead sibling's transcript sitting in a
+//     re-opened session's window. A claimed transcript is also withdrawn from
+//     the pool, so no other process can be paired to it -- which repairs the
+//     neighbours of a claiming process even when they claim nothing themselves.
+//
+//     EXCLUSIVITY IS PART OF THE EVIDENCE, NOT A DETAIL. A claim is an
+//     environment variable, and an environment is COPIED INTO EVERY CHILD
+//     PROCESS, so a program a desktop session started carries that session's id
+//     and, if it starts a session of its own, names the parent's transcript as
+//     its own. Measured on this Mac 2026-09-24: two host session ids, four live
+//     processes each. Two processes naming one transcript is therefore a
+//     routine occurrence, and it means exactly one thing -- the pass cannot
+//     tell which of them owns it. Treating both as certain owners judges the
+//     one that is really writing a DIFFERENT transcript by the silence of this
+//     one and kills it mid-task, which is the failure this whole file exists to
+//     prevent. So a contested transcript decides nobody: every claimant is left
+//     alone, and they do NOT fall through to tier 2 either, because the
+//     transcript one of them is really writing has already left the pool.
 //
 //  2. THE TIMESTAMP WINDOW. A process that claims nothing goes through the
 //     order-preserving, no-guessing pairing in pairing.go unchanged, and is
 //     killed only when every transcript it could own is stale. A third tier
 //     that compared working directories was measured and rejected; claim.go
 //     records the counterexample.
+//
+// Tier 1 needs no birth time -- only the mtime every filesystem reports -- so a
+// transcript whose creation time this OS will not expose still resolves a claim
+// and is only kept out of tier 2's pool (see listTranscripts).
 func (j *Janitor) decideDesktop(bprocs []procInfo, trs []transcriptInfo) map[int32]desktopDecision {
 	out := make(map[int32]desktopDecision, len(bprocs))
 	byID := make(map[string]transcriptInfo, len(trs))
@@ -168,8 +192,11 @@ func (j *Janitor) decideDesktop(bprocs []procInfo, trs []transcriptInfo) map[int
 		byID[transcriptID(tr.path)] = tr
 	}
 
-	// Tier 1.
-	claimedPath := make(map[string]bool)
+	// Tier 1, first half: collect every claim before judging any of them. A
+	// claim means nothing until it is known to be the only one on its
+	// transcript, so no decision can be made while claims are still arriving.
+	claimOf := make(map[int32]string, len(bprocs))
+	claimants := make(map[string]int, len(bprocs))
 	var rest []procInfo
 	for _, p := range bprocs {
 		id, ok := "", false
@@ -180,29 +207,54 @@ func (j *Janitor) decideDesktop(bprocs []procInfo, trs []transcriptInfo) map[int
 			rest = append(rest, p)
 			continue
 		}
+		claimOf[p.pid] = id
+		claimants[id]++
+	}
+
+	// Tier 1, second half: judge each claimant now that the count is known.
+	claimedPath := make(map[string]bool, len(claimOf))
+	for _, p := range bprocs {
+		id, claims := claimOf[p.pid]
+		if !claims {
+			continue
+		}
 		tr, known := byID[id]
-		if !known {
+		if known {
+			// Withdrawn from the pool whatever the verdict below: somebody
+			// among the claimants owns this transcript, so no process that
+			// claims nothing may be paired to it.
+			claimedPath[tr.path] = true
+		}
+		switch {
+		case claimants[id] > 1:
+			// Several processes name this transcript; see the exclusivity note
+			// above. Indeterminate, so nobody here is killed.
+			out[p.pid] = desktopDecision{reason: "several processes claim this transcript"}
+		case !known:
 			// The process named a transcript this pass cannot see: a live
 			// terminal session holds it, or it has not been created yet. Either
 			// way the timestamp route must not adopt the process, because its
 			// real transcript is not among the candidates.
 			out[p.pid] = desktopDecision{reason: "claims a transcript this pass cannot read"}
-			continue
+		default:
+			out[p.pid] = desktopDecision{tr: tr, ok: true, direct: true}
 		}
-		claimedPath[tr.path] = true
-		out[p.pid] = desktopDecision{tr: tr, ok: true, direct: true}
 	}
 
 	if len(rest) == 0 {
 		return out
 	}
 
-	// A claimed transcript has a known owner and is withdrawn from the pool.
+	// A claimed transcript has a known owner and is withdrawn from the pool. So
+	// is one whose birth time this OS does not expose: tier 2 pairs on birth
+	// time, and such a file's btime is a stand-in for its mtime, which for an
+	// append-forever transcript reads as "now" rather than creation.
 	pool := make([]transcriptInfo, 0, len(trs))
 	for _, tr := range trs {
-		if !claimedPath[tr.path] {
-			pool = append(pool, tr)
+		if claimedPath[tr.path] || !tr.hasBtime {
+			continue
 		}
+		pool = append(pool, tr)
 	}
 
 	// Tier 2.
@@ -236,10 +288,18 @@ func (j *Janitor) scanDesktop(procs []procInfo, now, cutoff time.Time, res *Resu
 	}
 
 	trs, noBtime := j.listTranscripts(reservedUUIDs(procs))
-	if len(trs) == 0 && noBtime > 0 {
-		// e.g. Linux filesystems without birth-time support: pairing is
-		// impossible, so B-class is deliberately inert rather than guessing.
-		j.logf("transcript birth times unavailable (%d files); desktop sessions left untouched", noBtime)
+	pairable := 0
+	for _, tr := range trs {
+		if tr.hasBtime {
+			pairable++
+		}
+	}
+	if noBtime > 0 && pairable == 0 {
+		// e.g. Linux filesystems without birth-time support: the timestamp
+		// route is impossible there, so it stays inert rather than guessing.
+		// Sessions that name their own transcript are judged normally -- that
+		// route reads mtime only.
+		j.logf("transcript birth times unavailable (%d files); only sessions that name their own transcript are judged", noBtime)
 	}
 
 	decided := j.decideDesktop(bprocs, trs)
@@ -289,18 +349,25 @@ func unpairableReason(v pairVerdict) string {
 	return "owner not certain"
 }
 
-// transcriptInfo is one projects/*/*.jsonl candidate for B-class pairing.
+// transcriptInfo is one projects/*/*.jsonl candidate for B-class resolution.
 type transcriptInfo struct {
-	btime time.Time
-	mtime time.Time
-	path  string
+	btime    time.Time
+	mtime    time.Time
+	path     string
+	hasBtime bool // false: btime is a stand-in, so this file may not be paired
 }
 
 // listTranscripts stats every transcript once, skipping the ids in reserved
-// (held by a live --resume session). Files without a real birth time (Linux
-// fallback) are excluded from pairing -- their btime would equal mtime, which
-// for an append-forever transcript is "now", not creation -- and counted in
-// noBtime so the caller can log the degradation.
+// (held by a live --resume session).
+//
+// A file whose birth time this OS will not expose (Linux filesystems without
+// statx support) is RETURNED ALL THE SAME, marked unpairable and counted in
+// noBtime. Dropping it here was wrong: it took the file out of the id lookup
+// too, so a session that names its own transcript got "claims a transcript this
+// pass cannot read" and the whole direct-evidence route went dark on those
+// systems -- safe, but the fix did not exist there. A claim needs only the
+// mtime, which every filesystem reports; it is the timestamp pairing that needs
+// a real creation time, and decideDesktop keeps these files out of that pool.
 func (j *Janitor) listTranscripts(reserved map[string]bool) (trs []transcriptInfo, noBtime int) {
 	matches, err := filepath.Glob(filepath.Join(j.cfg.ProjectsDir, "*", "*.jsonl"))
 	if err != nil {
@@ -311,15 +378,14 @@ func (j *Janitor) listTranscripts(reserved map[string]bool) (trs []transcriptInf
 		if reserved[id] {
 			continue // a live terminal session owns this transcript
 		}
-		ft, err := statTimes(m)
+		ft, err := j.stat(m)
 		if err != nil {
 			continue
 		}
 		if !ft.hasBtime {
 			noBtime++
-			continue
 		}
-		trs = append(trs, transcriptInfo{btime: ft.btime, mtime: ft.mtime, path: m})
+		trs = append(trs, transcriptInfo{btime: ft.btime, mtime: ft.mtime, path: m, hasBtime: ft.hasBtime})
 	}
 	return trs, noBtime
 }

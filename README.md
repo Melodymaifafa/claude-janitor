@@ -32,7 +32,7 @@ From a source checkout (needs [Go](https://go.dev/dl); builds a static binary an
 drops it on your PATH):
 
 ```sh
-git clone https://github.com/maicuigua/claude-janitor && cd claude-janitor
+git clone https://github.com/Melodymaifafa/claude-janitor && cd claude-janitor
 ./install.sh
 ```
 
@@ -44,33 +44,39 @@ Once binary releases are published (see **Publishing** below), the same script
 also serves the download form:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/maicuigua/claude-janitor/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Melodymaifafa/claude-janitor/main/install.sh | sh
 ```
 
-### Homebrew (macOS / Linux) — after a release is published
+### Download a prebuilt binary (any OS)
+
+Every `v*` tag publishes signed-off archives for macOS, Linux and Windows on
+amd64 and arm64. Grab the one for your platform from the
+[Releases](https://github.com/Melodymaifafa/claude-janitor/releases) page,
+unpack it, and put `claude-janitor` (`claude-janitor.exe` on Windows) somewhere
+on your `PATH`.
+
+macOS ships the binary unsigned, so clear the quarantine flag once:
 
 ```sh
-brew install maicuigua/tap/claude-janitor
+xattr -dr com.apple.quarantine /usr/local/bin/claude-janitor
 ```
 
-### Windows
+### Package managers — not live yet
 
-Scoop:
+Homebrew, Scoop and Winget are wired up in the release pipeline but switched
+off: they need registry repos and tokens that do not exist yet (see
+**Publishing**). Once they are live these will work, and this section will say
+so:
+
+```sh
+brew install Melodymaifafa/tap/claude-janitor          # macOS / Linux
+```
 
 ```powershell
-scoop bucket add maicuigua https://github.com/maicuigua/scoop-bucket
+scoop bucket add Melodymaifafa https://github.com/Melodymaifafa/scoop-bucket
 scoop install claude-janitor
+winget install Melodymaifafa.claude-janitor
 ```
-
-Winget:
-
-```powershell
-winget install maicuigua.claude-janitor
-```
-
-Or grab the `.zip` for your architecture from the
-[Releases](https://github.com/maicuigua/claude-janitor/releases) page and put
-`claude-janitor.exe` somewhere on your `PATH`.
 
 ### Build from source (any OS)
 
@@ -135,13 +141,22 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 
 This always builds Mac/Linux/Windows archives + checksums and attaches them to a
-GitHub Release. To *also* auto-update the package managers you must first create
-the registry repos and provide tokens as GitHub Actions secrets:
+GitHub Release, using only the automatic `GITHUB_TOKEN`.
 
-- **Homebrew** — a `maicuigua/homebrew-tap` repo + `HOMEBREW_TAP_GITHUB_TOKEN`.
-- **Scoop** — a `maicuigua/scoop-bucket` repo + `SCOOP_BUCKET_GITHUB_TOKEN`.
-- **Winget** — a `maicuigua/winget-pkgs` fork + `WINGET_GITHUB_TOKEN` (opens a PR
-  against `microsoft/winget-pkgs`).
+The Homebrew / Scoop / Winget steps are off until their registry repos and
+tokens exist. Each block in [`.goreleaser.yaml`](.goreleaser.yaml) carries a
+`skip_upload` guard keyed on its own token, so a missing secret skips that one
+publish step instead of failing the release — the binaries still ship and the
+workflow still goes green. Adding a secret turns its step on; nothing else to
+change. To switch them on, create under the `Melodymaifafa` account:
+
+- **Homebrew** — a `Melodymaifafa/homebrew-tap` repo + `HOMEBREW_TAP_GITHUB_TOKEN`.
+- **Scoop** — a `Melodymaifafa/scoop-bucket` repo + `SCOOP_BUCKET_GITHUB_TOKEN`.
+- **Winget** — a `Melodymaifafa/winget-pkgs` fork + `WINGET_GITHUB_TOKEN` (opens a
+  PR against `microsoft/winget-pkgs`).
+
+Each token is a GitHub PAT with `repo` scope, set at
+Settings → Secrets and variables → Actions on this repo.
 
 Validate the pipeline locally without publishing:
 

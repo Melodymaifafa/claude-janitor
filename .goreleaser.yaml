@@ -5,9 +5,14 @@
 # Run locally without publishing:  goreleaser release --snapshot --clean
 # Real release (from GitHub Actions on a v* tag):  goreleaser release --clean
 #
-# The brews/scoops/winget blocks push to registry repos that must exist and need
-# tokens that only the repo owner (Melody) can provide -- see README "Publishing"
-# and the MEL-94 follow-up sub-issue. Archives + checksums work with no extra setup.
+# Archives + checksums + the GitHub Release need no extra setup.
+#
+# The store blocks below (Homebrew cask / Scoop / Winget) each carry a
+# skip_upload guard keyed on their own token: when the token env var is unset or
+# empty, goreleaser skips that publish step instead of failing the release. So a
+# tag pushed today still ships six downloadable binaries and a green build, and
+# the store pushes switch on by themselves once the registry repos and the three
+# Actions secrets exist (see README "Publishing"). Leave the guards in place.
 version: 2
 
 project_name: claude-janitor
@@ -52,16 +57,18 @@ changelog:
       - "^test:"
       - "^chore:"
 
-# --- Homebrew (macOS): needs a tap repo maicuigua/homebrew-tap + a PAT in
-#     HOMEBREW_TAP_GITHUB_TOKEN. See README "Publishing". The post-install hook
-#     strips the Gatekeeper quarantine flag from the unsigned binary. ---
+# --- Homebrew (macOS): needs a tap repo Melodymaifafa/homebrew-tap + a PAT in
+#     HOMEBREW_TAP_GITHUB_TOKEN; skipped while that secret is absent. See README
+#     "Publishing". The post-install hook strips the Gatekeeper quarantine flag
+#     from the unsigned binary. ---
 homebrew_casks:
   - name: claude-janitor
+    skip_upload: '{{ if envOrDefault "HOMEBREW_TAP_GITHUB_TOKEN" "" }}false{{ else }}true{{ end }}'
     repository:
-      owner: maicuigua
+      owner: Melodymaifafa
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    homepage: https://github.com/maicuigua/claude-janitor
+    homepage: https://github.com/Melodymaifafa/claude-janitor
     description: Reclaim memory by killing idle Claude Code session processes
     hooks:
       post:
@@ -70,25 +77,29 @@ homebrew_casks:
             system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/claude-janitor"]
           end
 
-# --- Scoop (Windows): needs a bucket repo maicuigua/scoop-bucket. ---
+# --- Scoop (Windows): needs a bucket repo Melodymaifafa/scoop-bucket;
+#     skipped while SCOOP_BUCKET_GITHUB_TOKEN is absent. ---
 scoops:
-  - repository:
-      owner: maicuigua
+  - skip_upload: '{{ if envOrDefault "SCOOP_BUCKET_GITHUB_TOKEN" "" }}false{{ else }}true{{ end }}'
+    repository:
+      owner: Melodymaifafa
       name: scoop-bucket
       token: "{{ .Env.SCOOP_BUCKET_GITHUB_TOKEN }}"
-    homepage: https://github.com/maicuigua/claude-janitor
+    homepage: https://github.com/Melodymaifafa/claude-janitor
     description: Reclaim memory by killing idle Claude Code session processes
     license: MIT
 
-# --- Winget (Windows): opens a PR against microsoft/winget-pkgs via a fork. ---
+# --- Winget (Windows): opens a PR against microsoft/winget-pkgs via a fork;
+#     skipped while WINGET_GITHUB_TOKEN is absent. ---
 winget:
   - name: claude-janitor
-    publisher: maicuigua
+    skip_upload: '{{ if envOrDefault "WINGET_GITHUB_TOKEN" "" }}false{{ else }}true{{ end }}'
+    publisher: Melodymaifafa
     short_description: Reclaim memory by killing idle Claude Code session processes
     license: MIT
-    homepage: https://github.com/maicuigua/claude-janitor
+    homepage: https://github.com/Melodymaifafa/claude-janitor
     repository:
-      owner: maicuigua
+      owner: Melodymaifafa
       name: winget-pkgs
       branch: "claude-janitor-{{ .Version }}"
       token: "{{ .Env.WINGET_GITHUB_TOKEN }}"
@@ -101,7 +112,7 @@ winget:
 
 release:
   github:
-    owner: maicuigua
+    owner: Melodymaifafa
     name: claude-janitor
   draft: false
   prerelease: auto

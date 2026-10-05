@@ -22,6 +22,19 @@ BASE_URL="${CLAUDE_JANITOR_BASE_URL:-https://github.com/Melodymaifafa/claude-jan
 log()  { printf '%s\n' "$*"; }
 die()  { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
+# --- scratch dir -------------------------------------------------------------
+# The download path unpacks ~9 MB into a mktemp dir. Drop it on every exit path,
+# so a failed download leaves nothing behind either. The trailing assignment
+# keeps the handler's own status at 0, preserving the real exit code.
+DL_TMP=""
+cleanup() {
+    if [ "${DL_TMP:-}" ] && [ -d "$DL_TMP" ]; then
+        rm -rf "$DL_TMP"
+    fi
+    DL_TMP=""
+}
+trap cleanup EXIT HUP INT TERM
+
 # --- resolve install dir -----------------------------------------------------
 resolve_bindir() {
     if [ "${PREFIX:-}" ]; then
@@ -84,14 +97,15 @@ install_release() {
     ir_url="$1"
     log "downloading $ir_url"
     mkdir -p "$BINDIR"
-    ir_tmp="$(mktemp -d)"
-    curl -fsSL "$ir_url" -o "$ir_tmp/pkg.tar.gz" || die "download failed: $ir_url
+    DL_TMP="$(mktemp -d)"
+    curl -fsSL "$ir_url" -o "$DL_TMP/pkg.tar.gz" || die "download failed: $ir_url
   Check your network, or grab the archive by hand from $BASE_URL/releases
   and copy '$BIN' onto your PATH."
-    tar -xzf "$ir_tmp/pkg.tar.gz" -C "$ir_tmp" || die "could not unpack the archive from $ir_url"
-    ir_found="$(find "$ir_tmp" -type f -name "$BIN" | head -n1)"
+    tar -xzf "$DL_TMP/pkg.tar.gz" -C "$DL_TMP" || die "could not unpack the archive from $ir_url"
+    ir_found="$(find "$DL_TMP" -type f -name "$BIN" | head -n1)"
     [ "$ir_found" ] || die "no '$BIN' binary inside the archive from $ir_url"
     install -m 0755 "$ir_found" "$TARGET"
+    cleanup
 }
 
 # A source checkout has to be *this* project, not whatever directory the user

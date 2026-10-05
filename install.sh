@@ -33,7 +33,16 @@ cleanup() {
     fi
     DL_TMP=""
 }
-trap cleanup EXIT HUP INT TERM
+# EXIT only tidies up, so the script's own exit code survives untouched.
+trap cleanup EXIT
+# A signal has to STOP the install too. Without an explicit exit the handler
+# just returns and the shell resumes the script, which then finishes installing
+# and prints success -- an abort that silently installed anyway. Leave with
+# 128+signo, the status a signalled process conventionally reports. cleanup is
+# idempotent, so the EXIT trap running again on the way out is a no-op.
+trap 'cleanup; exit 129' HUP
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 # --- resolve install dir -----------------------------------------------------
 resolve_bindir() {

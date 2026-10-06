@@ -15,6 +15,10 @@ Cross-platform CLI (Go) that kills idle Claude Code session processes (idle > 2h
 
 Idleness is judged ONLY by the session transcript's mtime (`~/.claude/projects/*/<id>.jsonl`, updated on every message). Desktop sessions with no id in argv are paired to transcripts by birth time (see pairing.go and docs/design.md §2.B). That pairing must stay order-preserving, must skip transcripts a live `--resume` process owns, must never pick a "most plausible" candidate when several are possible (kill only when every possible transcript is stale), and must not invent an order from pid or file path when start times or birth times are equal (such groups are interchangeable). A smallest-gap rule swaps the pairs of sessions launched seconds apart, and hands a batch survivor an exited sibling's transcript; both kill the active session (MEL-231 review, 2026-09-24). Never judge desktop sessions by the app's `local_*.json` mtime — that file is rewritten only on UI events, never during task execution; using it killed active sessions mid-task (2026-07-30 incident). `--resume` appears in both space and `=` forms; handle both.
 
+## Desktop-app sessions — never kill
+
+A session whose parent is the app's live `Helpers/disclaimer` wrapper is skipped (`ownedByApp`), whatever its idle time. The app pauses its own idle sessions, and shows any outside SIGKILL as "Claude Code was stopped while starting — Security software… Team ID Q6L2SF6YDW": all 594 such errors in the app logs from 2026-08-15 to 2026-09-30 were janitor kills. The app re-opens sessions with `--resume=<id>`, so the gate must cover A-class too. Terminal sessions and sessions orphaned by an app crash are still cleaned.
+
 ## Workflow
 
 Linear project `claude-janitor` (team MEL) is the source of truth for current work. Agents have Linear MCP access.

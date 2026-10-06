@@ -14,6 +14,8 @@ type procInfo struct {
 	pid       int32
 	cmdline   []string // CmdlineSlice
 	createdAt time.Time
+	// ownedByApp: the desktop app is running this session. Never killed.
+	ownedByApp bool
 }
 
 // claudeCmdRe-style matching: the reference greps for the claude-code binary
@@ -132,11 +134,29 @@ func snapshotProcesses() ([]procInfo, error) {
 			continue
 		}
 		out = append(out, procInfo{
-			proc:      p,
-			pid:       p.Pid,
-			cmdline:   cmd,
-			createdAt: time.UnixMilli(ms),
+			proc:       p,
+			pid:        p.Pid,
+			cmdline:    cmd,
+			createdAt:  time.UnixMilli(ms),
+			ownedByApp: ownedByDesktopApp(p),
 		})
 	}
 	return out, nil
+}
+
+// ownedByDesktopApp reports whether the desktop app is still running this
+// session: its parent is the app's disclaimer wrapper, and that wrapper was not
+// orphaned (re-parented to pid 1) by an app crash. A lookup error means the
+// wrapper is gone or the parent is another user's (launchd): not the app's.
+func ownedByDesktopApp(p *process.Process) bool {
+	wrapper, err := p.Parent()
+	if err != nil || wrapper == nil {
+		return false
+	}
+	cmd, err := wrapper.Cmdline()
+	if err != nil || !isDisclaimerWrapper(cmd) {
+		return false
+	}
+	ppid, err := wrapper.Ppid()
+	return err == nil && ppid > 1
 }

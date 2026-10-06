@@ -74,8 +74,28 @@ func (s schtasksInstaller) Install(cfg Config) error {
 	return nil
 }
 
+// installedBinary reads "Task To Run" off a schtasks query of the periodic
+// task. A localized Windows names that field differently, which yields "" and
+// makes guardBinaryMatch refuse rather than guess.
+func (s schtasksInstaller) installedBinary(cfg Config) (string, bool, error) {
+	name := s.taskName(cfg.Label)
+	out, err := exec.Command("schtasks", "/Query", "/TN", name, "/FO", "LIST", "/V").CombinedOutput()
+	if err != nil {
+		low := strings.ToLower(string(out))
+		if strings.Contains(low, "cannot find") || strings.Contains(low, "does not exist") {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("schtasks: query %s failed: %w: %s", name, err, bytes.TrimSpace(out))
+	}
+	return firstShellToken(schtasksTaskToRun(string(out))), true, nil
+}
+
 func (s schtasksInstaller) Uninstall(cfg Config) error {
 	cfg = cfg.resolve()
+	// Before deleting anything: is this task ours? (MEL-267)
+	if err := guardBinaryMatch(s, cfg); err != nil {
+		return err
+	}
 	var firstErr error
 	for _, name := range []string{s.taskName(cfg.Label), s.logonTaskName(cfg.Label)} {
 		out, err := exec.Command("schtasks", "/Delete", "/TN", name, "/F").CombinedOutput()

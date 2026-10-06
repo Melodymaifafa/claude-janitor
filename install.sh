@@ -60,16 +60,23 @@ TARGET="$BINDIR/$BIN"
 
 # --- uninstall ---------------------------------------------------------------
 if [ "${1:-}" = "--uninstall" ]; then
-    # Best-effort: also drop the scheduled job if the binary is still runnable.
-    if command -v "$BIN" >/dev/null 2>&1; then
-        "$BIN" uninstall >/dev/null 2>&1 || true
+    # Drop the scheduled job too -- but only the job THIS install registered.
+    # Two things used to go wrong here and together they deleted the user's real
+    # cleanup job (MEL-267): `command -v claude-janitor` found whatever copy was
+    # on PATH rather than the one being removed, and `uninstall` matched on the
+    # job label alone, which every install shares. So run the binary we are
+    # about to delete, and have it check that the job really runs that path.
+    if [ -x "$TARGET" ]; then
+        "$TARGET" uninstall --binary "$TARGET" \
+            || log "could not read the scheduled job; left it alone"
+    else
+        log "no binary at $TARGET, so no scheduled job of this install to remove"
     fi
     if [ -e "$TARGET" ]; then
         rm -f "$TARGET" && log "removed $TARGET"
     else
         log "no binary at $TARGET (nothing to remove)"
     fi
-    log "done. (scheduled job removed if it was registered)"
     exit 0
 fi
 

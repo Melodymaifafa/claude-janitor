@@ -91,8 +91,50 @@ func (c cronInstaller) Install(cfg Config) error {
 	return writeCrontab(b.String())
 }
 
+// blockLines returns the lines inside the claude-janitor block for the label,
+// markers excluded. Empty when the block is absent.
+func blockLines(crontab, label string) []string {
+	begin, end := cronBeginMarker(label), cronEndMarker(label)
+	var inside []string
+	inBlock := false
+	for _, ln := range strings.Split(crontab, "\n") {
+		switch {
+		case strings.TrimSpace(ln) == begin:
+			inBlock = true
+		case strings.TrimSpace(ln) == end:
+			inBlock = false
+		case inBlock:
+			inside = append(inside, ln)
+		}
+	}
+	return inside
+}
+
+// installedBinary reads the program out of the first real command line in our
+// crontab block.
+func (c cronInstaller) installedBinary(cfg Config) (string, bool, error) {
+	current, err := readCrontab()
+	if err != nil {
+		return "", false, err
+	}
+	inside := blockLines(current, cfg.Label)
+	if len(inside) == 0 {
+		return "", false, nil
+	}
+	for _, ln := range inside {
+		if cmd := cronLineCommand(ln); cmd != "" {
+			return firstShellToken(cmd), true, nil
+		}
+	}
+	return "", true, nil
+}
+
 func (c cronInstaller) Uninstall(cfg Config) error {
 	cfg = cfg.resolve()
+	// Before rewriting the crontab: is this block ours? (MEL-267)
+	if err := guardBinaryMatch(c, cfg); err != nil {
+		return err
+	}
 	current, err := readCrontab()
 	if err != nil {
 		return err

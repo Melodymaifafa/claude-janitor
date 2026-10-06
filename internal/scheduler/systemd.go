@@ -121,8 +121,28 @@ func (s systemdInstaller) Install(cfg Config) error {
 	return nil
 }
 
+// installedBinary reads ExecStart out of the unit file the timer drives.
+func (s systemdInstaller) installedBinary(cfg Config) (string, bool, error) {
+	dir, err := s.unitDir()
+	if err != nil {
+		return "", false, err
+	}
+	data, err := os.ReadFile(filepath.Join(dir, unitBase(cfg.Label)+".service"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("systemd: read unit: %w", err)
+	}
+	return firstShellToken(unitExecStart(string(data))), true, nil
+}
+
 func (s systemdInstaller) Uninstall(cfg Config) error {
 	cfg = cfg.resolve()
+	// Before stopping anything: is this job ours? (MEL-267)
+	if err := guardBinaryMatch(s, cfg); err != nil {
+		return err
+	}
 	base := unitBase(cfg.Label)
 
 	// Stop + disable; ignore errors (timer may already be gone).

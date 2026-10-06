@@ -112,8 +112,30 @@ func (l launchdInstaller) Install(cfg Config) error {
 	return nil
 }
 
+// installedBinary reads ProgramArguments[0] out of the LaunchAgent plist.
+func (l launchdInstaller) installedBinary(cfg Config) (string, bool, error) {
+	plistFile, err := l.plistPath(cfg.Label)
+	if err != nil {
+		return "", false, err
+	}
+	data, err := os.ReadFile(plistFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("launchd: read plist: %w", err)
+	}
+	// An unparseable plist yields "", which guardBinaryMatch refuses -- better
+	// than unloading a job we cannot account for.
+	return plistFirstProgramArgument(data), true, nil
+}
+
 func (l launchdInstaller) Uninstall(cfg Config) error {
 	cfg = cfg.resolve()
+	// Before unloading anything: is this job ours? (MEL-267)
+	if err := guardBinaryMatch(l, cfg); err != nil {
+		return err
+	}
 	plistFile, err := l.plistPath(cfg.Label)
 	if err != nil {
 		return err

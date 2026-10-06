@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -47,6 +48,14 @@ func cmdUninstall(args []string) error {
 		return err
 	}
 	if err := inst.Uninstall(cfg); err != nil {
+		// Declining to touch somebody else's job is the safe outcome, not a
+		// failure: with --binary we were asked to remove one specific install's
+		// job, and this is not it (MEL-267).
+		var mismatch *scheduler.JobBinaryMismatchError
+		if errors.As(err, &mismatch) {
+			fmt.Printf("left the scheduled job alone: %v\n", mismatch)
+			return nil
+		}
 		return err
 	}
 	fmt.Printf("uninstalled scheduler job %q\n", cfg.Label)
@@ -60,7 +69,7 @@ func parseSchedulerFlags(name string, args []string) (scheduler.Config, *flag.Fl
 	var (
 		interval = fs.Int("interval", scheduler.DefaultIntervalMinutes, "scan interval in minutes")
 		label    = fs.String("label", scheduler.DefaultLabel, "scheduler job label (use a distinct value to avoid clobbering an existing job)")
-		binary   = fs.String("binary", "", "path to the claude-janitor binary to schedule (default: this executable)")
+		binary   = fs.String("binary", "", "path to the claude-janitor binary to schedule (default: this executable); on uninstall, only remove the job if it runs this exact path")
 		logPath  = fs.String("log", "", "log file path (default: ~/.claude/logs/claude-janitor.log)")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -69,6 +78,17 @@ func parseSchedulerFlags(name string, args []string) (scheduler.Config, *flag.Fl
 		}
 		return scheduler.Config{}, nil, err
 	}
+
+	// An explicit --binary names one specific install, so uninstall must not
+	// take out a job belonging to some other copy that shares the label. A
+	// defaulted path means "whatever is running", which carries no such claim,
+	// so the old label-only behavior stays (MEL-267).
+	binaryExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "binary" {
+			binaryExplicit = true
+		}
+	})
 
 	binPath := *binary
 	if binPath == "" {
@@ -88,5 +108,6 @@ func parseSchedulerFlags(name string, args []string) (scheduler.Config, *flag.Fl
 		IntervalMinutes: *interval,
 		Label:           *label,
 		LogPath:         *logPath,
+		MatchBinaryPath: binaryExplicit,
 	}, fs, nil
 }

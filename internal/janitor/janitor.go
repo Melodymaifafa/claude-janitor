@@ -35,7 +35,7 @@ import (
 type Result struct {
 	Killed  int
 	Spared  int // active sessions left running
-	Skipped int // processes left alone: no transcript resolvable/pairable
+	Skipped int // processes left alone: run by the desktop app, or no transcript resolvable/pairable
 }
 
 // Janitor runs scan-and-kill passes.
@@ -111,9 +111,7 @@ func (j *Janitor) scanTerminal(procs []procInfo, now, cutoff time.Time, res *Res
 			res.Spared++ // written recently -> active
 			continue
 		}
-		killed := killProcessTree(p.pid, j.cfg.DryRun)
-		j.report("terminal", p.pid, uuid, now.Sub(ft.mtime), killed)
-		res.Killed++
+		j.kill(p, "terminal", uuid, now.Sub(ft.mtime), res)
 	}
 }
 
@@ -157,10 +155,22 @@ func (j *Janitor) scanDesktop(procs []procInfo, now, cutoff time.Time, res *Resu
 			res.Spared++
 			continue
 		}
-		killed := killProcessTree(p.pid, j.cfg.DryRun)
-		j.report("desktop", p.pid, pairRef(v, newest), now.Sub(newest.tr.mtime), killed)
-		res.Killed++
+		j.kill(p, "desktop", pairRef(v, newest), now.Sub(newest.tr.mtime), res)
 	}
+}
+
+// kill ends an idle session's process tree unless the desktop app is running
+// it. The app pauses its own idle sessions, and shows an outside SIGKILL as
+// "Claude Code was stopped while starting ... security software" -- every one
+// of those banners from 2026-08-15 to 2026-09-30 was this janitor.
+func (j *Janitor) kill(p procInfo, class, ref string, idle time.Duration, res *Result) {
+	if p.ownedByApp {
+		res.Skipped++
+		j.logf("skip (desktop app session, never killed) PID=%d (idle %d min)", p.pid, int(idle.Minutes()))
+		return
+	}
+	j.report(class, p.pid, ref, idle, killProcessTree(p.pid, j.cfg.DryRun))
+	res.Killed++
 }
 
 // unpairableReason names why a process was left alone, so the ordinary

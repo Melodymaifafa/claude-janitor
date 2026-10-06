@@ -241,6 +241,45 @@ func TestScanDesktopOrphanTranscriptSparesSurvivor(t *testing.T) {
 	}
 }
 
+// TestDesktopAppSessionsNeverKilled: a session the desktop app is running is
+// left to the app however stale its transcript. The app pauses its own idle
+// sessions and shows an outside SIGKILL as "Claude Code was stopped while
+// starting ... security software". It re-opens a session with --resume=<id>,
+// so both scans must honor this. The same stale sessions outside the app die.
+func TestDesktopAppSessionsNeverKilled(t *testing.T) {
+	if !birthTimeSupported(t) {
+		t.Skip("no birth-time support on this filesystem")
+	}
+	for _, owned := range []bool{true, false} {
+		j, buf, mk := newTestJanitor(t)
+		now := time.Now()
+		cutoff := now.Add(-120 * time.Minute)
+		old := now.Add(-3 * time.Hour)
+		uuid := "12345678-1234-1234-1234-1234567890ab"
+		mk(uuid+".jsonl", old, old)
+		mk("bg-sess.jsonl", old, old)
+
+		reopened := procInfo{pid: 950001, cmdline: []string{"claude", "--output-format", "stream-json", "--resume=" + uuid},
+			createdAt: now.Add(-5 * time.Minute), ownedByApp: owned}
+		background := bgProc(950002, old.Add(-10*time.Second))
+		background.ownedByApp = owned
+		procs := []procInfo{reopened, background}
+
+		var res Result
+		j.scanTerminal(procs, now, cutoff, &res)
+		j.scanDesktop(procs, now, cutoff, &res)
+
+		wantKilled, wantSkipped := 2, 0
+		if owned {
+			wantKilled, wantSkipped = 0, 2
+		}
+		if res.Killed != wantKilled || res.Skipped != wantSkipped {
+			t.Errorf("ownedByApp=%v: got killed=%d skipped=%d, want %d/%d\nlog:\n%s",
+				owned, res.Killed, res.Skipped, wantKilled, wantSkipped, buf.String())
+		}
+	}
+}
+
 // TestScanDesktopIgnoresNonBClass: --resume sessions and non-stream-json
 // processes are not desktop candidates at all.
 func TestScanDesktopIgnoresNonBClass(t *testing.T) {

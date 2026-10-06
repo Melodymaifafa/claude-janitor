@@ -30,6 +30,13 @@ Source: `~/.claude/scripts/claude-session-janitor.sh` (zsh) +
   that transcript's mtime. Unpairable processes are never killed.
 - Both classes use **SIGKILL (-9)**, not SIGTERM — the background processes
   ignore TERM.
+- **Ownership gate (2026-10-01):** neither class kills a process whose parent is
+  the app's disclaimer wrapper while that wrapper still has a live parent. The
+  app pauses its own idle sessions and shows an outside SIGKILL as "Claude Code
+  was stopped while starting — security software"; all 594 such errors in its
+  logs (2026-08-15 → 09-30) were janitor kills. Re-opened app sessions carry
+  `--resume=<uuid>`, so they had been landing in A. The wrapper-parent kill
+  above now only fires for sessions orphaned by an app crash.
 - **Superseded (2026-07-30, do not reintroduce):** B-class originally judged
   idleness by the desktop app's `local_<uuid>.json` mtime. That file is a
   UI-event snapshot rewritten whole on create/reopen and never during task

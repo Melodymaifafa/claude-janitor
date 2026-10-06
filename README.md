@@ -24,6 +24,11 @@ by the same signal: the mtime of the session's transcript
 Active sessions have a fresh transcript mtime, so they are never touched. Session
 files are never deleted — you can always resume.
 
+Sessions the Claude desktop app is still running are never killed, however idle.
+The app pauses its own idle sessions, and it reports an outside kill as "Claude
+Code was stopped while starting — security software". The janitor only cleans
+them up after an app crash leaves them orphaned.
+
 ## Install
 
 ### One-line install (macOS / Linux)

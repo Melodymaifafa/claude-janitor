@@ -1,6 +1,11 @@
 package janitor
 
-import "testing"
+import (
+	"os"
+	"testing"
+
+	"github.com/shirou/gopsutil/v3/process"
+)
 
 func TestResumeUUID(t *testing.T) {
 	cases := []struct {
@@ -95,5 +100,30 @@ func TestIsDisclaimerWrapper(t *testing.T) {
 		if isDisclaimerWrapper(c) {
 			t.Errorf("must not match a non-wrapper parent: %q", c)
 		}
+	}
+}
+
+// TestPidReused: Windows never re-parents an orphan, so a recorded parent that
+// started after its child is a newer process holding the dead parent's pid.
+// Equal starts are genuine: the wrapper spawns its session at once.
+func TestPidReused(t *testing.T) {
+	if pidReused(100, 200) || pidReused(200, 200) {
+		t.Error("a parent that started first is the real parent")
+	}
+	if !pidReused(300, 200) {
+		t.Error("a parent younger than its child must be a reused pid")
+	}
+}
+
+// TestLiveParentOfThisProcess: a live tree hands back the real parent. If this
+// lookup broke, every desktop-app session would fall back to the kill path.
+func TestLiveParentOfThisProcess(t *testing.T) {
+	self, err := process.NewProcess(int32(os.Getpid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, ok := liveParent(self)
+	if !ok || parent.Pid != int32(os.Getppid()) {
+		t.Fatalf("liveParent(self) ok=%v, want the real parent pid %d", ok, os.Getppid())
 	}
 }

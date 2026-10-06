@@ -41,8 +41,10 @@ func killProcessTree(pid int32, dryRun bool) []int32 {
 // shell -- killing that would take out their terminal tab -- so any
 // non-disclaimer parent returns -1 (nothing above the session is killed).
 func wrapperParent(p *process.Process) int32 {
-	parent, err := p.Parent()
-	if err != nil || parent == nil {
+	// Only a live parent: on Windows a dead wrapper's pid may now belong to
+	// another session's wrapper, and killing that would end the wrong session.
+	parent, ok := liveParent(p)
+	if !ok {
 		return -1
 	}
 	cmd, err := parent.Cmdline()

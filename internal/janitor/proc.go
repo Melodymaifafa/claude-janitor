@@ -145,18 +145,43 @@ func snapshotProcesses() ([]procInfo, error) {
 }
 
 // ownedByDesktopApp reports whether the desktop app is still running this
-// session: its parent is the app's disclaimer wrapper, and that wrapper was not
-// orphaned (re-parented to pid 1) by an app crash. A lookup error means the
-// wrapper is gone or the parent is another user's (launchd): not the app's.
+// session: its live parent is the app's disclaimer wrapper, and that wrapper
+// still has a live parent other than pid 1, where Unix re-parents orphans.
 func ownedByDesktopApp(p *process.Process) bool {
-	wrapper, err := p.Parent()
-	if err != nil || wrapper == nil {
+	wrapper, ok := liveParent(p)
+	if !ok {
 		return false
 	}
 	cmd, err := wrapper.Cmdline()
 	if err != nil || !isDisclaimerWrapper(cmd) {
 		return false
 	}
-	ppid, err := wrapper.Ppid()
-	return err == nil && ppid > 1
+	app, ok := liveParent(wrapper)
+	return ok && app.Pid > 1
+}
+
+// liveParent returns p's parent only while it is really alive. Unix re-parents
+// an orphan, but Windows keeps the dead parent's pid, which a newer process may
+// since have reused. A lookup error means the parent is gone or belongs to
+// another user (launchd): either way not one the app owns.
+func liveParent(p *process.Process) (*process.Process, bool) {
+	parent, err := p.Parent()
+	if err != nil || parent == nil {
+		return nil, false
+	}
+	childStart, err := p.CreateTime()
+	if err != nil {
+		return nil, false
+	}
+	parentStart, err := parent.CreateTime()
+	if err != nil || pidReused(parentStart, childStart) {
+		return nil, false
+	}
+	return parent, true
+}
+
+// pidReused reports whether a recorded parent started after its child, i.e. the
+// real parent died and its pid went to a newer process.
+func pidReused(parentStart, childStart int64) bool {
+	return parentStart > childStart
 }

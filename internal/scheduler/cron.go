@@ -110,23 +110,41 @@ func blockLines(crontab, label string) []string {
 	return inside
 }
 
-// installedBinary reads the program out of the first real command line in our
-// crontab block.
+// installedBinary reads the program out of our crontab block.
 func (c cronInstaller) installedBinary(cfg Config) (string, bool, error) {
 	current, err := readCrontab()
 	if err != nil {
 		return "", false, err
 	}
-	inside := blockLines(current, cfg.Label)
+	got, found := cronBlockBinary(current, cfg)
+	return got, found, nil
+}
+
+// cronBlockBinary returns the program the block for cfg.Label runs. Uninstall
+// strips the whole block, so every command line in it has to be checked, not
+// just the first: when any entry runs something other than cfg.BinaryPath,
+// that program is returned so the guard leaves the block alone. found=false
+// when there is no block.
+func cronBlockBinary(crontab string, cfg Config) (string, bool) {
+	inside := blockLines(crontab, cfg.Label)
 	if len(inside) == 0 {
-		return "", false, nil
+		return "", false
 	}
+	got := ""
 	for _, ln := range inside {
-		if cmd := cronLineCommand(ln); cmd != "" {
-			return firstShellToken(cmd), true, nil
+		cmd := cronLineCommand(ln)
+		if cmd == "" {
+			continue
+		}
+		prog := firstShellToken(cmd)
+		if !sameBinaryPath(prog, cfg.BinaryPath) {
+			return prog, true
+		}
+		if got == "" {
+			got = prog
 		}
 	}
-	return "", true, nil
+	return got, true
 }
 
 func (c cronInstaller) Uninstall(cfg Config) error {

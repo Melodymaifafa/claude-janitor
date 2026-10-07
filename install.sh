@@ -47,7 +47,15 @@ trap 'cleanup; exit 143' TERM
 # --- resolve install dir -----------------------------------------------------
 resolve_bindir() {
     if [ "${PREFIX:-}" ]; then
-        printf '%s/bin' "$PREFIX"; return
+        # Anchor a relative PREFIX here, once. The scheduled job records the
+        # binary's absolute path, so `--uninstall` handing over a relative one
+        # would never recognise its own job; and the source build runs
+        # `go build -o` from the checkout, where a relative path lands elsewhere.
+        case "$PREFIX" in
+            /*) printf '%s/bin' "$PREFIX" ;;
+            *)  printf '%s/%s/bin' "$PWD" "$PREFIX" ;;
+        esac
+        return
     fi
     if [ -w /usr/local/bin ] 2>/dev/null; then
         printf '/usr/local/bin'; return

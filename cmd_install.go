@@ -105,10 +105,13 @@ func parseSchedulerFlags(name string, args []string) (scheduler.Config, *flag.Fl
 		if err != nil {
 			return scheduler.Config{}, nil, fmt.Errorf("cannot resolve own path (pass --binary): %w", err)
 		}
-		if abs, err := filepath.Abs(self); err == nil {
-			self = abs
-		}
 		binPath = self
+	}
+	// Absolute either way: the scheduler runs the job from another directory,
+	// and on uninstall a relative --binary could never match the absolute path
+	// the job records, so the check would leave this install's own job behind.
+	if abs, err := filepath.Abs(binPath); err == nil {
+		binPath = abs
 	}
 
 	return scheduler.Config{

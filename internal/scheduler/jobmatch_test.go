@@ -252,6 +252,41 @@ func TestCronInstalledBinaryReadsOurBlock(t *testing.T) {
 	}
 }
 
+// Uninstall strips the whole block, so one entry that runs another program has
+// to stop it, whichever entry that is -- not only when it happens to be first.
+func TestCronBlockBinaryChecksEveryEntry(t *testing.T) {
+	label := "com.test.cj"
+	block := func(reboot, periodic string) string {
+		return "0 0 * * * echo hi\n" + cronBeginMarker(label) + "\n" +
+			"@reboot " + reboot + " run\n*/30 * * * * " + periodic + " run\n" +
+			cronEndMarker(label) + "\n"
+	}
+	cfg := Config{Label: label, BinaryPath: "/opt/cj", MatchBinaryPath: true}
+	cases := []struct {
+		name     string
+		crontab  string
+		mismatch bool
+	}{
+		{"both entries ours", block("/opt/cj", "/opt/cj"), false},
+		{"periodic entry runs another binary", block("/opt/cj", "/usr/local/bin/cj"), true},
+		{"@reboot entry runs another binary", block("/usr/local/bin/cj", "/opt/cj"), true},
+		{"no block", "0 0 * * * echo hi\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, found := cronBlockBinary(tc.crontab, cfg)
+			err := guardBinaryMatch(fakeProber{path: got, found: found}, cfg)
+			var mismatch *JobBinaryMismatchError
+			switch {
+			case tc.mismatch && !errors.As(err, &mismatch):
+				t.Fatalf("cronBlockBinary = (%q, %v): want JobBinaryMismatchError, got %v", got, found, err)
+			case !tc.mismatch && err != nil:
+				t.Fatalf("cronBlockBinary = (%q, %v): want nil, got %v", got, found, err)
+			}
+		})
+	}
+}
+
 func TestSchtasksTaskToRun(t *testing.T) {
 	out := "Folder: \\\r\nTaskName:      \\com.test.cj\r\nTask To Run:   C:\\cj\\cj.exe run\r\nStatus:        Ready\r\n"
 	if got := schtasksTaskToRun(out); got != `C:\cj\cj.exe run` {

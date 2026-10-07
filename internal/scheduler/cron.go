@@ -91,8 +91,68 @@ func (c cronInstaller) Install(cfg Config) error {
 	return writeCrontab(b.String())
 }
 
+// blockLines returns the lines inside the claude-janitor block for the label,
+// markers excluded. Empty when the block is absent.
+func blockLines(crontab, label string) []string {
+	begin, end := cronBeginMarker(label), cronEndMarker(label)
+	var inside []string
+	inBlock := false
+	for _, ln := range strings.Split(crontab, "\n") {
+		switch {
+		case strings.TrimSpace(ln) == begin:
+			inBlock = true
+		case strings.TrimSpace(ln) == end:
+			inBlock = false
+		case inBlock:
+			inside = append(inside, ln)
+		}
+	}
+	return inside
+}
+
+// installedBinary reads the program out of our crontab block.
+func (c cronInstaller) installedBinary(cfg Config) (string, bool, error) {
+	current, err := readCrontab()
+	if err != nil {
+		return "", false, err
+	}
+	got, found := cronBlockBinary(current, cfg)
+	return got, found, nil
+}
+
+// cronBlockBinary returns the program the block for cfg.Label runs. Uninstall
+// strips the whole block, so every command line in it has to be checked, not
+// just the first: when any entry runs something other than cfg.BinaryPath,
+// that program is returned so the guard leaves the block alone. found=false
+// when there is no block.
+func cronBlockBinary(crontab string, cfg Config) (string, bool) {
+	inside := blockLines(crontab, cfg.Label)
+	if len(inside) == 0 {
+		return "", false
+	}
+	got := ""
+	for _, ln := range inside {
+		cmd := cronLineCommand(ln)
+		if cmd == "" {
+			continue
+		}
+		prog := firstShellToken(cmd)
+		if !sameBinaryPath(prog, cfg.BinaryPath) {
+			return prog, true
+		}
+		if got == "" {
+			got = prog
+		}
+	}
+	return got, true
+}
+
 func (c cronInstaller) Uninstall(cfg Config) error {
 	cfg = cfg.resolve()
+	// Before rewriting the crontab: is this block ours? (MEL-267)
+	if err := guardBinaryMatch(c, cfg); err != nil {
+		return err
+	}
 	current, err := readCrontab()
 	if err != nil {
 		return err

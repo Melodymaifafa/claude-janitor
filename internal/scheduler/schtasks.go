@@ -74,10 +74,39 @@ func (s schtasksInstaller) Install(cfg Config) error {
 	return nil
 }
 
+// schtasksTask probes one task by name. Each task carries its own /TR and can
+// outlive the other (a failed delete, a rolled-back install), so Uninstall
+// checks the periodic and logon tasks separately: a missing periodic task says
+// nothing about who owns the logon one.
+type schtasksTask string
+
+// installedBinary reads "Task To Run" off a schtasks query of the task. A
+// localized Windows names that field differently, which yields "" and makes
+// guardBinaryMatch refuse rather than guess.
+func (t schtasksTask) installedBinary(Config) (string, bool, error) {
+	name := string(t)
+	out, err := exec.Command("schtasks", "/Query", "/TN", name, "/FO", "LIST", "/V").CombinedOutput()
+	if err != nil {
+		low := strings.ToLower(string(out))
+		if strings.Contains(low, "cannot find") || strings.Contains(low, "does not exist") {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("schtasks: query %s failed: %w: %s", name, err, bytes.TrimSpace(out))
+	}
+	return firstShellToken(schtasksTaskToRun(string(out))), true, nil
+}
+
 func (s schtasksInstaller) Uninstall(cfg Config) error {
 	cfg = cfg.resolve()
+	names := []string{s.taskName(cfg.Label), s.logonTaskName(cfg.Label)}
+	// Before deleting anything: are both tasks ours? (MEL-267)
+	for _, name := range names {
+		if err := guardBinaryMatch(schtasksTask(name), cfg); err != nil {
+			return err
+		}
+	}
 	var firstErr error
-	for _, name := range []string{s.taskName(cfg.Label), s.logonTaskName(cfg.Label)} {
+	for _, name := range names {
 		out, err := exec.Command("schtasks", "/Delete", "/TN", name, "/F").CombinedOutput()
 		if err != nil {
 			// "cannot find the file" / "does not exist" -> already gone, fine.

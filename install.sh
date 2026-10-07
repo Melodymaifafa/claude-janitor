@@ -1,30 +1,61 @@
 #!/bin/sh
 # claude-janitor one-command installer (macOS / Linux).
 #
-# From a source checkout:
-#     ./install.sh                 # build with Go and install to a bin dir on PATH
-#     ./install.sh --uninstall     # remove the installed binary
-#
-# Once binary releases exist (goreleaser + GitHub Actions, .goreleaser.yaml),
-# the published one-liner becomes:
+# One-liner (downloads the latest release archive for your platform):
 #     curl -fsSL https://raw.githubusercontent.com/Melodymaifafa/claude-janitor/main/install.sh | sh
-# and this script downloads the matching release archive instead of building.
-# Set CLAUDE_JANITOR_RELEASE_URL to force the download path.
+#
+# From a source checkout (builds with Go):
+#     ./install.sh
+#     ./install.sh --uninstall     # remove the installed binary
 #
 # Install location: $PREFIX/bin (default /usr/local/bin if writable, else
 # ~/.local/bin). Override with PREFIX=/some/where ./install.sh.
+#
+# Other overrides:
+#     CLAUDE_JANITOR_RELEASE_URL   install this exact archive, skip the lookup
+#     CLAUDE_JANITOR_BASE_URL      repo web base used for the release lookup
 set -eu
 
 BIN=claude-janitor
-REPO_RAW="https://raw.githubusercontent.com/Melodymaifafa/claude-janitor/main"
+BASE_URL="${CLAUDE_JANITOR_BASE_URL:-https://github.com/Melodymaifafa/claude-janitor}"
 
 log()  { printf '%s\n' "$*"; }
 die()  { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
+# --- scratch dir -------------------------------------------------------------
+# The download path unpacks ~9 MB into a mktemp dir. Drop it on every exit path,
+# so a failed download leaves nothing behind either. The trailing assignment
+# keeps the handler's own status at 0, preserving the real exit code.
+DL_TMP=""
+cleanup() {
+    if [ "${DL_TMP:-}" ] && [ -d "$DL_TMP" ]; then
+        rm -rf "$DL_TMP"
+    fi
+    DL_TMP=""
+}
+# EXIT only tidies up, so the script's own exit code survives untouched.
+trap cleanup EXIT
+# A signal has to STOP the install too. Without an explicit exit the handler
+# just returns and the shell resumes the script, which then finishes installing
+# and prints success -- an abort that silently installed anyway. Leave with
+# 128+signo, the status a signalled process conventionally reports. cleanup is
+# idempotent, so the EXIT trap running again on the way out is a no-op.
+trap 'cleanup; exit 129' HUP
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
 # --- resolve install dir -----------------------------------------------------
 resolve_bindir() {
     if [ "${PREFIX:-}" ]; then
-        printf '%s/bin' "$PREFIX"; return
+        # Anchor a relative PREFIX here, once. The scheduled job records the
+        # binary's absolute path, so `--uninstall` handing over a relative one
+        # would never recognise its own job; and the source build runs
+        # `go build -o` from the checkout, where a relative path lands elsewhere.
+        case "$PREFIX" in
+            /*) printf '%s/bin' "$PREFIX" ;;
+            *)  printf '%s/%s/bin' "$PWD" "$PREFIX" ;;
+        esac
+        return
     fi
     if [ -w /usr/local/bin ] 2>/dev/null; then
         printf '/usr/local/bin'; return
@@ -37,40 +68,112 @@ TARGET="$BINDIR/$BIN"
 
 # --- uninstall ---------------------------------------------------------------
 if [ "${1:-}" = "--uninstall" ]; then
-    # Best-effort: also drop the scheduled job if the binary is still runnable.
-    if command -v "$BIN" >/dev/null 2>&1; then
-        "$BIN" uninstall >/dev/null 2>&1 || true
+    # Drop the scheduled job too -- but only the job THIS install registered.
+    # Two things used to go wrong here and together they deleted the user's real
+    # cleanup job (MEL-267): `command -v claude-janitor` found whatever copy was
+    # on PATH rather than the one being removed, and `uninstall` matched on the
+    # job label alone, which every install shares. So run the binary we are
+    # about to delete, and have it check that the job really runs that path.
+    # --match-binary is what makes that check safe to rely on: a binary built
+    # before it existed accepts --binary but ignores it here and removes the job
+    # by label anyway, while it rejects --match-binary and changes nothing.
+    if [ -x "$TARGET" ]; then
+        "$TARGET" uninstall --binary "$TARGET" --match-binary \
+            || log "could not confirm the scheduled job is this install's (an older $BIN cannot check); left it alone"
+    else
+        log "no binary at $TARGET, so no scheduled job of this install to remove"
     fi
     if [ -e "$TARGET" ]; then
         rm -f "$TARGET" && log "removed $TARGET"
     else
         log "no binary at $TARGET (nothing to remove)"
     fi
-    log "done. (scheduled job removed if it was registered)"
     exit 0
 fi
 
-mkdir -p "$BINDIR"
+# --- release download helpers ------------------------------------------------
+# goreleaser (.goreleaser.yaml) names archives
+# claude-janitor_<version>_<os>_<arch>.tar.gz, with <version> the tag minus "v".
+platform_suffix() {
+    ps_os="$(uname -s)"
+    case "$ps_os" in
+        Darwin) ps_os=darwin ;;
+        Linux)  ps_os=linux ;;
+        *) die "no prebuilt binary for OS '$ps_os'. Build from source instead: git clone $BASE_URL && cd $BIN && ./install.sh" ;;
+    esac
+    ps_arch="$(uname -m)"
+    case "$ps_arch" in
+        x86_64|amd64)  ps_arch=amd64 ;;
+        arm64|aarch64) ps_arch=arm64 ;;
+        *) die "no prebuilt binary for CPU '$ps_arch'. Build from source instead: git clone $BASE_URL && cd $BIN && ./install.sh" ;;
+    esac
+    printf '%s_%s' "$ps_os" "$ps_arch"
+}
 
-# --- build from source (in-repo) or download a release -----------------------
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Latest tag, read off the redirect GitHub serves for /releases/latest.
+# Fails (non-zero, no output) when the repo has no published release yet.
+latest_tag() {
+    lt_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' "$BASE_URL/releases/latest")" || return 1
+    case "$lt_url" in
+        */releases/tag/?*) printf '%s' "${lt_url##*/releases/tag/}" ;;
+        *) return 1 ;;
+    esac
+}
+
+install_release() {
+    ir_url="$1"
+    log "downloading $ir_url"
+    mkdir -p "$BINDIR"
+    DL_TMP="$(mktemp -d)"
+    curl -fsSL "$ir_url" -o "$DL_TMP/pkg.tar.gz" || die "download failed: $ir_url
+  Check your network, or grab the archive by hand from $BASE_URL/releases
+  and copy '$BIN' onto your PATH."
+    tar -xzf "$DL_TMP/pkg.tar.gz" -C "$DL_TMP" || die "could not unpack the archive from $ir_url"
+    ir_found="$(find "$DL_TMP" -type f -name "$BIN" | head -n1)"
+    [ "$ir_found" ] || die "no '$BIN' binary inside the archive from $ir_url"
+    install -m 0755 "$ir_found" "$TARGET"
+    cleanup
+}
+
+# A source checkout has to be *this* project, not whatever directory the user
+# happens to be standing in.
+in_source_tree() {
+    [ "${1:-}" ] || return 1
+    [ -f "$1/go.mod" ] || return 1
+    [ -f "$1/install.sh" ] || return 1
+    grep -q "^module .*/$BIN\$" "$1/go.mod" 2>/dev/null
+}
+
+# --- pick the install path ---------------------------------------------------
+# Piped into a shell (`curl ... | sh`) there is no script file: $0 is the shell
+# itself, so dirname "$0" would point at the user's current directory, which has
+# nothing to do with this project. Leave SCRIPT_DIR empty in that case and go
+# down the download path -- never build whatever happens to sit in $PWD.
+SCRIPT_DIR=""
+case "$(basename -- "$0")" in
+    sh|bash|dash|ksh|zsh|ash|busybox) ;;
+    *)
+        if [ -f "$0" ]; then
+            SCRIPT_DIR="$(cd "$(dirname -- "$0")" && pwd)"
+        fi
+        ;;
+esac
 
 if [ "${CLAUDE_JANITOR_RELEASE_URL:-}" ]; then
-    log "downloading release: $CLAUDE_JANITOR_RELEASE_URL"
-    tmp="$(mktemp -d)"
-    curl -fsSL "$CLAUDE_JANITOR_RELEASE_URL" -o "$tmp/pkg.tar.gz" || die "download failed"
-    tar -xzf "$tmp/pkg.tar.gz" -C "$tmp" || die "extract failed"
-    found="$(find "$tmp" -type f -name "$BIN" | head -n1)"
-    [ "$found" ] || die "no '$BIN' binary inside the archive"
-    install -m 0755 "$found" "$TARGET"
-    rm -rf "$tmp"
-elif [ -f "$SCRIPT_DIR/go.mod" ]; then
-    command -v go >/dev/null 2>&1 || die "Go is required to build from source (https://go.dev/dl). Or set CLAUDE_JANITOR_RELEASE_URL."
+    install_release "$CLAUDE_JANITOR_RELEASE_URL"
+elif in_source_tree "$SCRIPT_DIR"; then
+    command -v go >/dev/null 2>&1 || die "Go is required to build from source (https://go.dev/dl). Or set CLAUDE_JANITOR_RELEASE_URL to a release archive."
     log "building $BIN from source with $(go version | awk '{print $3}')..."
+    mkdir -p "$BINDIR"
     ( cd "$SCRIPT_DIR" && go build -o "$TARGET" . ) || die "go build failed"
     chmod 0755 "$TARGET"
 else
-    die "run from a source checkout, or set CLAUDE_JANITOR_RELEASE_URL to a release archive"
+    suffix="$(platform_suffix)" || exit 1
+    tag="$(latest_tag)" || die "could not find a published release at $BASE_URL/releases/latest (none published yet, or no network).
+  Build from source instead:
+    git clone $BASE_URL && cd $BIN && ./install.sh
+  Or point CLAUDE_JANITOR_RELEASE_URL at a ${BIN}_<version>_$suffix.tar.gz archive."
+    install_release "$BASE_URL/releases/download/$tag/${BIN}_${tag#v}_$suffix.tar.gz"
 fi
 
 log "installed $BIN -> $TARGET"

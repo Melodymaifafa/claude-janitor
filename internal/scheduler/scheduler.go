@@ -37,6 +37,15 @@ type Config struct {
 	// LogPath is where the job's stdout/stderr go. Empty means the installer
 	// picks a per-OS default under the user's home/.claude/logs.
 	LogPath string
+
+	// MatchBinaryPath narrows Uninstall to jobs this BinaryPath owns: the job
+	// is removed only if the program it runs is BinaryPath, otherwise Uninstall
+	// changes nothing and returns *JobBinaryMismatchError. Set it whenever
+	// BinaryPath names a specific install rather than "whatever is running" --
+	// every install shares the default Label, so matching on the label alone
+	// let a temp-dir install delete the user's real job (MEL-267). Install
+	// ignores this field.
+	MatchBinaryPath bool
 }
 
 // Installer registers (Install) and deregisters (Uninstall) the periodic job.
@@ -47,7 +56,9 @@ type Installer interface {
 	// replaces the previous registration.
 	Install(cfg Config) error
 	// Uninstall deactivates and removes the artifact completely. Returns nil if
-	// nothing was installed (safe to call repeatedly).
+	// nothing was installed (safe to call repeatedly). With
+	// Config.MatchBinaryPath set it leaves a job that runs some other program
+	// untouched and returns *JobBinaryMismatchError.
 	Uninstall(cfg Config) error
 	// Describe returns a human-readable, one-line summary of where the job
 	// lives, for the CLI to print after install/uninstall.

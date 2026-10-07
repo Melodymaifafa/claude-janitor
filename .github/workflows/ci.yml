@@ -1,0 +1,15 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+jobs:
+  ci:
+    uses: Melodymaifafa/gh-workflows/.github/workflows/ci.yml@v1
+    with:
+      runtime: node
+      install_cmd: 'go mod download'
+      lint_cmd: 'go vet ./...'
+      test_cmd: 'go test ./...'

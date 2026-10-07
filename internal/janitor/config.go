@@ -12,10 +12,23 @@ type Config struct {
 	// kill-logic slice only records it; the scheduler consumes it. Default 30 min.
 	ScanInterval time.Duration
 
-	// PairBefore/PairAfter bound the transcript-birth vs process-start gap when
-	// pairing desktop sessions: birth must fall in [start-PairBefore,
-	// start+PairAfter]. Measured on-box: transcripts appear 4-14s after process
-	// start; PairBefore only absorbs clock rounding. Defaults 15s / 120s.
+	// PairBefore/PairAfter bound the transcript-birth vs process-start gap for
+	// the sessions that make no direct claim (see claim.go): birth must fall in
+	// [start-PairBefore, start+PairAfter]. Defaults 15s / 120s.
+	//
+	// MEL-237 measured the real lag over 2001 desktop sessions on this Mac: 1972
+	// transcripts appeared within 15s of their session starting, 11 more within
+	// 30s, and NOT ONE between 30s and 120s. That says a 30s window would lose
+	// nothing -- FOR DESKTOP SESSIONS. It is deliberately NOT applied, because
+	// those are exactly the sessions that now name their own transcript and
+	// never reach this window. The processes that do reach it are the
+	// stream-json sessions something other than the desktop app started, and
+	// they were never in that sample: a live one on this Mac had its two
+	// candidate transcripts appear 40.7s and 67.5s after it started, so a 30s
+	// window would have made it permanently uncollectable. Narrowing on evidence
+	// drawn from the wrong population is a guess wearing a measurement's
+	// clothes, so the window stays where it was and the fix comes from the
+	// claim instead.
 	PairBefore time.Duration
 	PairAfter  time.Duration
 
@@ -24,6 +37,12 @@ type Config struct {
 
 	// ProjectsDir overrides the transcript root (default ~/.claude/projects).
 	ProjectsDir string
+
+	// SessionsDir overrides where the desktop app keeps its per-session records,
+	// which turn a process's claimed host session id into a transcript id (see
+	// claim.go). Empty or absent means claims do not resolve and the desktop
+	// scan degrades to the timestamp window alone.
+	SessionsDir string
 }
 
 // Defaults returns the reference configuration.

@@ -190,18 +190,28 @@ func TestReservedUUIDsBothResumeForms(t *testing.T) {
 // leaves them -- a process whose OWN transcript was just written must never be
 // selected for kill.
 //
-// Generation stays inside the regime the design supports: batches where the
-// transcripts were born in the same order the processes started. Outside it the
-// birth order itself lies, and pairing.go documents that no timestamp-only rule
-// can recover the truth there.
+// MEL-237 widened the generator to the GENERATION-ORDER-INVERSION case: batches
+// whose transcripts appeared in a different order than their sessions started.
+// That happens whenever the creation lag varies by more than the launch
+// spacing, and on this Mac it is ordinary rather than exotic -- the lag ranges
+// from 2.5s to 14.4s over 2001 measured sessions, and 3 of the 18 real session
+// pairs launched within 15s of each other had their transcripts appear in the
+// opposite order. Before, every such batch was discarded as out of regime.
+//
+// Inverted batches are now generated and asserted on, because the decision no
+// longer rests on timestamps alone: a session that names its own transcript is
+// resolved directly, and its transcript is withdrawn from the pool, which
+// repairs its neighbours too. What is still out of regime is much narrower and
+// is stated exactly: among the sessions that name NOTHING, the birth order must
+// still agree with the launch order, because for those nothing but timestamps
+// exists. Each session claims or does not claim independently, so batches mix.
 func TestPairingNeverKillsAWritingSession(t *testing.T) {
 	rng := rand.New(rand.NewSource(20260924))
-	j := New(Config{ProjectsDir: t.TempDir(), DryRun: true}, &bytes.Buffer{})
 	now := time.Now()
 	cutoff := now.Add(-120 * time.Minute)
 	base := now.Add(-4 * time.Hour)
 
-	checked := 0
+	checked, invertedBatches, coClaimBatches := 0, 0, 0
 	for iter := 0; iter < 4000; iter++ {
 		sessions := 2 + rng.Intn(4)
 
@@ -215,17 +225,40 @@ func TestPairingNeverKillsAWritingSession(t *testing.T) {
 		for i := 0; i < sessions; i++ {
 			at = at.Add(time.Duration(rng.Intn(21)) * time.Second)
 			starts[i] = at
-			born := at.Add(time.Duration(4+rng.Intn(11)) * time.Second)
+			// The measured lag range on this Mac, floor to p99.
+			born := at.Add(time.Duration(2+rng.Intn(13)) * time.Second)
 			births[i] = born.Truncate(grid)
 		}
-		inverted := false
+
+		// Who names their own transcript. A desktop-app session always does; a
+		// stream-json process started by something else never does.
+		claims := make([]bool, sessions)
+		for i := range claims {
+			claims[i] = rng.Intn(4) > 0
+		}
+
+		// Out of regime only for the sessions that name nothing: among those,
+		// the birth order must still match the launch order.
+		ok := true
+		last := -1
+		for i := 0; i < sessions; i++ {
+			if claims[i] {
+				continue
+			}
+			if last >= 0 && births[i].Before(births[last]) {
+				ok = false
+				break
+			}
+			last = i
+		}
+		if !ok {
+			continue
+		}
 		for i := 1; i < sessions; i++ {
 			if births[i].Before(births[i-1]) {
-				inverted = true
+				invertedBatches++
+				break
 			}
-		}
-		if inverted {
-			continue // outside the supported regime; see the doc comment
 		}
 
 		// Some sessions are still writing; some exited and left a stale transcript.
@@ -233,6 +266,8 @@ func TestPairingNeverKillsAWritingSession(t *testing.T) {
 		writing := make([]bool, sessions)
 		var procs []procInfo
 		var trs []transcriptInfo
+		claimOf := map[int32]string{}
+		var claiming []int32 // pids that name a transcript, in launch order
 		for i := 0; i < sessions; i++ {
 			alive[i] = rng.Intn(2) == 0
 			writing[i] = alive[i] && rng.Intn(2) == 0
@@ -243,36 +278,67 @@ func TestPairingNeverKillsAWritingSession(t *testing.T) {
 			// A random name key: on disk, path order tells you nothing about
 			// creation order, and a generator whose paths happen to sort in launch
 			// order would hide exactly that.
-			trs = append(trs, transcriptInfo{
-				btime: births[i],
-				mtime: mtime,
-				path:  fmt.Sprintf("/p/%04d-sess-%02d.jsonl", rng.Intn(10000), i),
-			})
+			path := fmt.Sprintf("/p/%04d-sess-%02d.jsonl", rng.Intn(10000), i)
+			trs = append(trs, transcriptInfo{btime: births[i], mtime: mtime, path: path, hasBtime: true})
 			if alive[i] {
 				procs = append(procs, bgProc(int32(1000+i), starts[i]))
+				if claims[i] {
+					claimOf[int32(1000+i)] = transcriptID(path)
+					claiming = append(claiming, int32(1000+i))
+				}
 			}
 		}
 		if len(procs) == 0 {
 			continue
 		}
 
-		verdicts := j.pairDesktop(procs, trs)
+		// Some batches contain a session that names ANOTHER session's
+		// transcript. An environment variable is copied into every child
+		// process, so a program a desktop session started carries that
+		// session's id and, when it starts a session of its own, names the
+		// parent's transcript -- measured on this Mac as two host session ids
+		// held by four live processes each. Both namers then point at one
+		// transcript and the pass cannot tell which of them owns it, so neither
+		// may be judged on it.
+		if len(claiming) >= 2 && rng.Intn(3) == 0 {
+			a := claiming[rng.Intn(len(claiming))]
+			b := claiming[rng.Intn(len(claiming))]
+			if a != b {
+				claimOf[a] = claimOf[b]
+				coClaimBatches++
+			}
+		}
+
+		j := New(Config{ProjectsDir: t.TempDir(), DryRun: true}, &bytes.Buffer{})
+		j.claim = func(p procInfo) (string, bool) {
+			id, ok := claimOf[p.pid]
+			return id, ok
+		}
+
+		decided := j.decideDesktop(procs, trs)
 		for i := 0; i < sessions; i++ {
 			if !writing[i] {
 				continue
 			}
 			checked++
-			c, ok := verdicts[int32(1000+i)].decisive()
-			if ok && !c.tr.mtime.After(cutoff) {
-				t.Fatalf("iter %d: session %d is still writing but was judged idle\nstarts=%v\nbirths=%v\nalive=%v writing=%v\nchosen=%s mtime=%v",
-					iter, i, starts, births, alive, writing, c.tr.path, c.tr.mtime)
+			d := decided[int32(1000+i)]
+			if d.ok && !d.tr.mtime.After(cutoff) {
+				t.Fatalf("iter %d: session %d is still writing but was judged idle\nstarts=%v\nbirths=%v\nalive=%v writing=%v claims=%v\nchosen=%s mtime=%v direct=%v",
+					iter, i, starts, births, alive, writing, claims, d.tr.path, d.tr.mtime, d.direct)
 			}
 		}
 	}
 	if checked < 500 {
 		t.Fatalf("only %d active sessions exercised; the generator is not covering the case", checked)
 	}
-	t.Logf("checked %d active sessions across random batches", checked)
+	if invertedBatches < 200 {
+		t.Fatalf("only %d batches had their transcripts appear out of launch order; the widening is not biting", invertedBatches)
+	}
+	if coClaimBatches < 200 {
+		t.Fatalf("only %d batches had two sessions naming one transcript; the widening is not biting", coClaimBatches)
+	}
+	t.Logf("checked %d active sessions; %d batches had inverted birth order, %d had two sessions naming one transcript",
+		checked, invertedBatches, coClaimBatches)
 }
 
 // TestPairDesktopEqualStartsAreInterchangeable: two desktop processes whose start
@@ -290,8 +356,8 @@ func TestPairDesktopEqualStartsAreInterchangeable(t *testing.T) {
 	build := func(secondMtime time.Time) map[int32]pairVerdict {
 		j := New(Config{ProjectsDir: t.TempDir(), DryRun: true}, &bytes.Buffer{})
 		trs := []transcriptInfo{
-			{btime: start.Add(9 * time.Second), mtime: start.Add(30 * time.Second), path: "/p/first.jsonl"},
-			{btime: start.Add(12 * time.Second), mtime: secondMtime, path: "/p/second.jsonl"},
+			{btime: start.Add(9 * time.Second), mtime: start.Add(30 * time.Second), path: "/p/first.jsonl", hasBtime: true},
+			{btime: start.Add(12 * time.Second), mtime: secondMtime, path: "/p/second.jsonl", hasBtime: true},
 		}
 		// Identical createdAt: gopsutil reports whole milliseconds.
 		procs := []procInfo{bgProc(950001, start), bgProc(950002, start)}
@@ -331,8 +397,8 @@ func TestPairDesktopEqualBirthTimesAreInterchangeable(t *testing.T) {
 	build := func(secondMtime time.Time) map[int32]pairVerdict {
 		j := New(Config{ProjectsDir: t.TempDir(), DryRun: true}, &bytes.Buffer{})
 		trs := []transcriptInfo{
-			{btime: born, mtime: base.Add(30 * time.Second), path: "/p/aaa.jsonl"},
-			{btime: born, mtime: secondMtime, path: "/p/bbb.jsonl"},
+			{btime: born, mtime: base.Add(30 * time.Second), path: "/p/aaa.jsonl", hasBtime: true},
+			{btime: born, mtime: secondMtime, path: "/p/bbb.jsonl", hasBtime: true},
 		}
 		procs := []procInfo{bgProc(960001, base), bgProc(960002, base.Add(4*time.Second))}
 		return j.pairDesktop(procs, trs)

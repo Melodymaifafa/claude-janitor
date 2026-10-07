@@ -43,27 +43,31 @@ import (
 //     that some maximum pairing leaves out entirely has no activity evidence at
 //     all and is never killed.
 //
-// TWO RESIDUAL LIMITS, both needing information this file does not have. Closing
-// either needs a direct ownership signal -- an open file handle on the
-// transcript, or the session id recorded inside it -- not a better timing rule.
-// Tracked as a follow-up; see docs/design.md §2.B.
+// BOTH RESIDUAL LIMITS ARE CLOSED, and not here -- they needed information this
+// file does not have, so claim.go supplies it and this file is simply not
+// consulted for a session that names its own transcript (MEL-237).
 //
-//   - Inverted birth order. When the creation lag d varies by more than the
-//     launch spacing Δ (14s for one session, 4s for one started 5s later) the
-//     birth order itself inverts, so the pairing lands on the wrong transcript of
-//     the same batch.
+//   - Inverted birth order. When the creation lag varies by more than the launch
+//     spacing the birth order itself inverts, and this file lands on the wrong
+//     transcript of the batch. Measured on this Mac: the lag runs 2.5s to 14.4s,
+//     and 3 of the 18 real session pairs launched within 15s of each other had
+//     their transcripts appear in the opposite order. It is the normal regime,
+//     not an edge case.
 //
 //   - A re-opened session with an orphan in its window. A re-opened session
 //     appends its ORIGINAL transcript, whose birth predates the new process, so
 //     that transcript is out of window and cannot be a candidate. If a sibling
 //     that exited left exactly one stale transcript born inside the window, this
-//     code sees one process, one candidate, and treats it as certain. The data is
-//     identical to the ordinary case of a single desktop session whose own
-//     transcript went stale -- which is the case B-class cleanup exists for -- so
-//     refusing to kill on one candidate would not make the tool safer, it would
-//     make it do nothing. Reaching this needs a sibling transcript created within
-//     ~2 minutes of the re-open that then went silent for the whole idle
-//     threshold while the re-opened session kept working.
+//     code sees one process, one candidate, and treats it as certain. The data
+//     is identical to the ordinary case of a single desktop session whose own
+//     transcript went stale -- which is the case B-class cleanup exists for --
+//     so refusing to kill on one candidate would not make the tool safer, it
+//     would make it do nothing.
+//
+// What still holds for the processes that claim nothing: their birth order must
+// agree with their launch order, because for them nothing but timestamps
+// exists. A claimed transcript is withdrawn from the pool before this file
+// runs, which also repairs the unclaiming neighbours of a claiming process.
 
 // pairAssignment is one transcript a process could own.
 type pairAssignment struct {

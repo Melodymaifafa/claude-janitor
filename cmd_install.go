@@ -49,8 +49,8 @@ func cmdUninstall(args []string) error {
 	}
 	if err := inst.Uninstall(cfg); err != nil {
 		// Declining to touch somebody else's job is the safe outcome, not a
-		// failure: with --binary we were asked to remove one specific install's
-		// job, and this is not it (MEL-267).
+		// failure: with --binary / --match-binary we were asked to remove one
+		// specific install's job, and this is not it (MEL-267).
 		var mismatch *scheduler.JobBinaryMismatchError
 		if errors.As(err, &mismatch) {
 			fmt.Printf("left the scheduled job alone: %v\n", mismatch)
@@ -72,6 +72,15 @@ func parseSchedulerFlags(name string, args []string) (scheduler.Config, *flag.Fl
 		binary   = fs.String("binary", "", "path to the claude-janitor binary to schedule (default: this executable); on uninstall, only remove the job if it runs this exact path")
 		logPath  = fs.String("log", "", "log file path (default: ~/.claude/logs/claude-janitor.log)")
 	)
+	// --match-binary asks out loud for what an explicit --binary already implies
+	// on uninstall. Scripts should pass it anyway: a binary built before MEL-267
+	// accepts --binary (an install flag it always had) yet still removes the job
+	// by label alone, whereas it rejects an unknown flag before touching anything.
+	// Install has no use for it, so only uninstall defines it.
+	var matchBinary bool
+	if name == "uninstall" {
+		fs.BoolVar(&matchBinary, "match-binary", false, "only remove the job if it runs --binary (default: this executable); implied by an explicit --binary")
+	}
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return scheduler.Config{}, nil, nil
@@ -82,7 +91,7 @@ func parseSchedulerFlags(name string, args []string) (scheduler.Config, *flag.Fl
 	// An explicit --binary names one specific install, so uninstall must not
 	// take out a job belonging to some other copy that shares the label. A
 	// defaulted path means "whatever is running", which carries no such claim,
-	// so the old label-only behavior stays (MEL-267).
+	// so the old label-only behavior stays unless --match-binary asks (MEL-267).
 	binaryExplicit := false
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "binary" {
@@ -108,6 +117,6 @@ func parseSchedulerFlags(name string, args []string) (scheduler.Config, *flag.Fl
 		IntervalMinutes: *interval,
 		Label:           *label,
 		LogPath:         *logPath,
-		MatchBinaryPath: binaryExplicit,
+		MatchBinaryPath: binaryExplicit || matchBinary,
 	}, fs, nil
 }

@@ -74,11 +74,17 @@ func (s schtasksInstaller) Install(cfg Config) error {
 	return nil
 }
 
-// installedBinary reads "Task To Run" off a schtasks query of the periodic
-// task. A localized Windows names that field differently, which yields "" and
-// makes guardBinaryMatch refuse rather than guess.
-func (s schtasksInstaller) installedBinary(cfg Config) (string, bool, error) {
-	name := s.taskName(cfg.Label)
+// schtasksTask probes one task by name. Each task carries its own /TR and can
+// outlive the other (a failed delete, a rolled-back install), so Uninstall
+// checks the periodic and logon tasks separately: a missing periodic task says
+// nothing about who owns the logon one.
+type schtasksTask string
+
+// installedBinary reads "Task To Run" off a schtasks query of the task. A
+// localized Windows names that field differently, which yields "" and makes
+// guardBinaryMatch refuse rather than guess.
+func (t schtasksTask) installedBinary(Config) (string, bool, error) {
+	name := string(t)
 	out, err := exec.Command("schtasks", "/Query", "/TN", name, "/FO", "LIST", "/V").CombinedOutput()
 	if err != nil {
 		low := strings.ToLower(string(out))
@@ -92,12 +98,15 @@ func (s schtasksInstaller) installedBinary(cfg Config) (string, bool, error) {
 
 func (s schtasksInstaller) Uninstall(cfg Config) error {
 	cfg = cfg.resolve()
-	// Before deleting anything: is this task ours? (MEL-267)
-	if err := guardBinaryMatch(s, cfg); err != nil {
-		return err
+	names := []string{s.taskName(cfg.Label), s.logonTaskName(cfg.Label)}
+	// Before deleting anything: are both tasks ours? (MEL-267)
+	for _, name := range names {
+		if err := guardBinaryMatch(schtasksTask(name), cfg); err != nil {
+			return err
+		}
 	}
 	var firstErr error
-	for _, name := range []string{s.taskName(cfg.Label), s.logonTaskName(cfg.Label)} {
+	for _, name := range names {
 		out, err := exec.Command("schtasks", "/Delete", "/TN", name, "/F").CombinedOutput()
 		if err != nil {
 			// "cannot find the file" / "does not exist" -> already gone, fine.

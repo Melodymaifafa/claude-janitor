@@ -66,9 +66,12 @@ if [ "${1:-}" = "--uninstall" ]; then
     # on PATH rather than the one being removed, and `uninstall` matched on the
     # job label alone, which every install shares. So run the binary we are
     # about to delete, and have it check that the job really runs that path.
+    # --match-binary is what makes that check safe to rely on: a binary built
+    # before it existed accepts --binary but ignores it here and removes the job
+    # by label anyway, while it rejects --match-binary and changes nothing.
     if [ -x "$TARGET" ]; then
-        "$TARGET" uninstall --binary "$TARGET" \
-            || log "could not read the scheduled job; left it alone"
+        "$TARGET" uninstall --binary "$TARGET" --match-binary \
+            || log "could not confirm the scheduled job is this install's (an older $BIN cannot check); left it alone"
     else
         log "no binary at $TARGET, so no scheduled job of this install to remove"
     fi

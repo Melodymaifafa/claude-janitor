@@ -139,7 +139,11 @@ binary to schedule; defaults to the running one), `--log PATH` (defaults to
 will remove: the job goes only if it actually runs `PATH`, otherwise nothing is
 touched and it says so. That is how `./install.sh --uninstall` avoids deleting
 the job belonging to a different copy of claude-janitor, since every install
-shares the default label.
+shares the default label. `uninstall --match-binary` asks for the same check
+explicitly (against `--binary`, or the running binary without it); scripts
+should pass it, because a claude-janitor built before this check accepts
+`--binary` yet removes the job by label anyway, whereas it rejects
+`--match-binary` and touches nothing.
 
 ## Publishing (maintainer)
 

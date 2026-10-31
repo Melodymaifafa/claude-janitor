@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/shirou/gopsutil/v3/process"
 )
 
 // Direct ownership evidence for desktop (B-class) sessions.
@@ -64,13 +66,52 @@ import (
 // environment of every session process the app launches.
 const hostSessionEnvVar = "CLAUDE_CODE_HOST_SESSION_ID"
 
+// ONLY THE APP'S OWN PROCESSES MAY CLAIM (MEL-534, 2026-11-01). The id is an
+// environment variable, so every process started under a desktop session
+// inherits it. momo (pm2 -> node) was started from the "duolinguo" session, so
+// each agent it launched carried that session's id and named its transcript,
+// silent for three days, as its own: a three-minute-old agent got
+// `would kill ... claimed 1546c991-... (idle 4997 min)`. With the desktop
+// session's own process gone, nothing made the claim look contested.
+//
+// Measured on this Mac: each of the eight live sessions the app started had the
+// app's Helpers/disclaimer wrapper as its live parent; the agent's parent was
+// momo's node. The start times split them too -- the three fresh app sessions
+// started in the same second as their session record's createdAt, the agent
+// 17 days after its record's -- but a session the app re-opens starts days after
+// its record, so the parent chain is the test. It also covers the crash orphan:
+// its wrapper survives, re-parented to pid 1. design.md §2.B has the table.
+
 // claimedSessionID returns the transcript id this process states it owns, read
 // from the process's own environment and the desktop app's record of that
-// session. ok is false whenever any link is missing -- another user's process,
-// a platform that will not show an environment, a session the app did not
-// launch, a record that has not been written yet. A missing claim is never
-// evidence of anything; the caller falls back to the weaker tiers.
+// session -- but only for a process the desktop app launched (see above). ok is
+// false whenever any link is missing -- a process some other program started,
+// another user's process, a platform that will not show an environment, a
+// record that has not been written yet. A missing claim is never evidence of
+// anything; the caller falls back to the weaker tiers.
 func (j *Janitor) claimedSessionID(p procInfo) (string, bool) {
+	if p.proc == nil || !launchedByDesktopApp(p.proc) {
+		return "", false
+	}
+	return j.envSessionID(p)
+}
+
+// launchedByDesktopApp reports whether the desktop app started this process:
+// its live parent is the app's disclaimer wrapper. Unlike ownedByDesktopApp it
+// does not ask whether the app is still running above the wrapper, so it holds
+// for a session orphaned by an app crash as well.
+func launchedByDesktopApp(p *process.Process) bool {
+	wrapper, ok := liveParent(p)
+	if !ok {
+		return false
+	}
+	cmd, err := wrapper.Cmdline()
+	return err == nil && isDisclaimerWrapper(cmd)
+}
+
+// envSessionID is the transcript id the process's environment names, whoever
+// started the process. claimedSessionID decides whether that counts.
+func (j *Janitor) envSessionID(p procInfo) (string, bool) {
 	env, err := procEnviron(p.pid)
 	if err != nil || len(env) == 0 {
 		return "", false

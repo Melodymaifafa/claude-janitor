@@ -103,8 +103,8 @@ transcript:
 and no `--resume`. Each such process is resolved to its transcript in two
 tiers, evidence first (MEL-237):
 
-1. **The session's own claim, when it is the only one — exact, and no
-   timestamp in it.** A desktop session process carries
+1. **The session's own claim, when the app started it and it is the only
+   one — exact, and no timestamp in it.** A desktop session process carries
    `CLAUDE_CODE_HOST_SESSION_ID` in its environment: the desktop app's id for
    that session. The app's record of that session
    (`claude-code-sessions/*/*/<hostId>.json`) states, in `cliSessionId`, which
@@ -128,11 +128,34 @@ tiers, evidence first (MEL-237):
    either, because the transcript one of them is really writing has already
    left the pool. Reproduced on real processes against the real binary: the
    unfixed build printed `would kill` for both, the fixed build skips both.
-   *Boundary:* when the claimant that really owns the transcript has already
-   exited, a lone inheritor is the only namer left and is judged on the
-   inherited transcript. Nothing separates them — inheritance copies the whole
-   environment, so no variable distinguishes an inherited claim from an own
-   one, and another live namer is the only evidence there is.
+
+   **Only a process the app started may claim** (MEL-534, 2026-11-01).
+   Exclusivity cannot help when the real owner has exited: then an inheritor
+   is the only namer. That killed live work. momo (pm2 → node) was started
+   from the "duolinguo" desktop session, so every agent it launched inherited
+   that session's id, and with the session's own process gone, `6110e10`
+   printed `would kill (desktop) … claimed 1546c991-… (idle 4997 min)` for a
+   three-minute-old agent. No variable separates an inherited id from an own
+   one, but the parent chain does. Measured on this Mac:
+
+   | Process | Live parent | Process start vs. the id's record `createdAt` |
+   |---|---|---|
+   | 8 live app sessions | the app's `Helpers/disclaimer` wrapper | — |
+   | 3 of them, fresh (B-class) | wrapper | same second |
+   | 2 of them, re-opened (`--resume=`) | wrapper | 5 days later |
+   | momo agent | momo's `node` (← pm2 ← launchd) | 17 days later |
+
+   Start time also separates the agent but fails on a session the app
+   re-opens, so the test is the parent: the id counts only when the process's
+   live parent is the app's disclaimer wrapper (`launchedByDesktopApp`). That
+   holds for a crash orphan too, whose wrapper survives re-parented to pid 1 —
+   the shape `ownedByApp` and the wrapper kill already assume. Any other
+   process claims nothing and goes to tier 2 unchanged, as it did before
+   MEL-237. A live stand-in with momo's parent chain and inherited id: `0c90937`
+   and the fix skip it as unpairable, `6110e10` prints `would kill`. Since then
+   a co-claim needs two processes the app itself started; never observed, but
+   the exclusivity rule stays.
+
    **A claim needs no creation time.** Listing the transcripts once dropped
    every file whose birth time the OS would not report (Linux filesystems
    without `statx` support) before the id lookup was built, so on those systems
@@ -209,8 +232,9 @@ reproduced):
   by regression tests built on real processes and real files
   (`internal/janitor/claim_test.go`), each asserting that the timestamp-only
   path kills the session that is actively writing and that the claim path does
-  not. The two holes the claim itself opened — a contested transcript, and a
-  filesystem with no creation time — carry their own tests in the same file,
+  not. The three holes the claim itself opened — a contested transcript, a
+  filesystem with no creation time, and an id inherited by a process the app
+  did not start — carry their own tests in the same file,
   each with a "before" arm that reproduces the old behaviour on the same
   fixture so neither test can pass against itself.
 - **What was measured to get there, on this Mac, 2026-09-24.** The two routes

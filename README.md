@@ -54,9 +54,11 @@ curl -fsSL https://raw.githubusercontent.com/Melodymaifafa/claude-janitor/main/i
 
 ### Download a prebuilt binary (any OS) — not live yet
 
-No version has been released yet, so the Releases page is empty. For now,
-install from source: the one-line install above, or **Build from source** below.
-Once a release is out, this section will say so:
+No version has been released yet, so the Releases page is empty and the
+`curl … | sh` form above fails too. For now, install from source: `git clone`
+the repo and run `./install.sh` from the checkout (see **One-line install**
+above), or **Build from source** below. Once a release is out, this section
+will say so:
 
 Every `v*` tag publishes signed-off archives for macOS, Linux and Windows on
 amd64 and arm64. Grab the one for your platform from the

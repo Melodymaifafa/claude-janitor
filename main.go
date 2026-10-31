@@ -18,9 +18,11 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime/debug"
 )
 
 // Overridden at build time via goreleaser ldflags (-X main.version=...).
+// Builds without them fall back to Go's VCS stamp (see buildStamp).
 var (
 	version = "dev"
 	commit  = "none"
@@ -41,7 +43,9 @@ func main() {
 			exitErr(cmdUninstall(args[1:]))
 			return
 		case "version", "--version", "-v":
-			fmt.Printf("claude-janitor %s (commit %s, built %s)\n", version, commit, date)
+			info, _ := debug.ReadBuildInfo()
+			c, d := buildStamp(commit, date, info)
+			fmt.Printf("claude-janitor %s (commit %s, built %s)\n", version, c, d)
 			return
 		case "-h", "--help", "help":
 			usage()
@@ -50,6 +54,24 @@ func main() {
 	}
 
 	os.Exit(cmdRun(args))
+}
+
+// buildStamp fills a commit or date that ldflags left at its default from the
+// vcs.revision / vcs.time Go embeds when building a git checkout, so a plain
+// "go build" still says which commit it is. info is nil when Go recorded none.
+func buildStamp(commit, date string, info *debug.BuildInfo) (string, string) {
+	if info == nil {
+		return commit, date
+	}
+	for _, s := range info.Settings {
+		switch {
+		case s.Key == "vcs.revision" && commit == "none":
+			commit = s.Value[:min(7, len(s.Value))]
+		case s.Key == "vcs.time" && date == "unknown":
+			date = s.Value
+		}
+	}
+	return commit, date
 }
 
 // exitErr prints a scheduler error and exits non-zero, or returns on success.

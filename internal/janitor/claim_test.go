@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -36,7 +37,18 @@ import (
 // tests, so realProc can copy it under the name "claude".
 const fakeSessionEnv = "JANITOR_FAKE_SESSION_SECONDS"
 
+// fakeRoleEnv makes this test binary play the desktop app ("app") or its
+// disclaimer wrapper ("wrapper") instead, so a session can be given the parent
+// chain the app gives it -- the chain the claim now turns on (MEL-534).
+const fakeRoleEnv = "JANITOR_FAKE_ROLE"
+
 func TestMain(m *testing.M) {
+	switch os.Getenv(fakeRoleEnv) {
+	case "app":
+		os.Exit(fakeApp(os.Args[1:]))
+	case "wrapper":
+		os.Exit(fakeWrapper(os.Args[1:]))
+	}
 	if v := os.Getenv(fakeSessionEnv); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
@@ -48,52 +60,101 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// realProc starts a live process that looks like a desktop session: argv[0] is
-// a binary named "claude", it carries --output-format stream-json and no
-// --resume, its working directory is workdir, and its environment names hostID
-// as the desktop app's session id. It returns the procInfo a real pass would
-// build for it, with the start time and working directory read back off the
-// running process rather than invented.
+// fakeWrapper runs the command after "--" the way the app's disclaimer wrapper
+// does, prints "<own pid> <session pid>" so the test can find both, and waits.
+func fakeWrapper(args []string) int {
+	i := slices.Index(args, "--")
+	if i < 0 || i+1 >= len(args) {
+		return 2
+	}
+	cmd := exec.Command(args[i+1], args[i+2:]...)
+	cmd.Env = withRole(os.Environ(), "")
+	if err := cmd.Start(); err != nil {
+		return 2
+	}
+	fmt.Printf("%d %d\n", os.Getpid(), cmd.Process.Pid)
+	_ = cmd.Wait()
+	return 0
+}
+
+// fakeApp starts the wrapper command it is given and exits at once, leaving the
+// wrapper and its session behind the way an app crash does.
+func fakeApp(args []string) int {
+	if len(args) == 0 {
+		return 2
+	}
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Env = withRole(os.Environ(), "wrapper")
+	cmd.Stdout = os.Stdout
+	if err := cmd.Start(); err != nil {
+		return 2
+	}
+	return 0
+}
+
+// withRole returns env with fakeRoleEnv set to role, or removed when role is "".
+func withRole(env []string, role string) []string {
+	out := slices.DeleteFunc(slices.Clone(env), func(kv string) bool {
+		return strings.HasPrefix(kv, fakeRoleEnv+"=")
+	})
+	if role != "" {
+		out = append(out, fakeRoleEnv+"="+role)
+	}
+	return out
+}
+
+// launcher is the parent a test session gets.
+type launcher int
+
+const (
+	byApp        launcher = iota // the app's wrapper, the app still running
+	byCrashedApp                 // the app's wrapper, after the app that started it is gone
+	byProgram                    // an ordinary program that carries a desktop session's environment
+)
+
+// realProc starts a live desktop session the way the app does, under its
+// disclaimer wrapper; see startSession.
 func realProc(t *testing.T, bindir, workdir, hostID string) procInfo {
+	t.Helper()
+	return startSession(t, bindir, workdir, hostID, byApp)
+}
+
+// startSession starts a live process that looks like a desktop session: argv[0]
+// is a binary named "claude", it carries --output-format stream-json and no
+// --resume, its working directory is workdir, its environment names hostID as
+// the desktop app's session id, and how decides its parent. It returns the
+// procInfo a real pass would build for it, with the start time read back off
+// the running process rather than invented. ownedByApp is left false: these
+// tests are about what the pass concludes, and the gate that leaves the app's
+// sessions to the app comes after that, in kill, with tests of its own.
+func startSession(t *testing.T, bindir, workdir, hostID string, how launcher) procInfo {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("the claim route is unsupported on Windows; there is nothing here to exercise")
 	}
-	exe := filepath.Join(bindir, "claude")
-	if _, err := os.Stat(exe); err != nil {
-		// A real, unsigned binary named "claude". Two things rule out the
-		// obvious alternatives: macOS rewrites a shebang script's argv[0] to the
-		// interpreter, hiding the name the session filter matches on, and it
-		// refuses to show the argv or environment of an Apple-signed binary such
-		// as /bin/sh to a non-root reader, which is the very thing under test.
-		// This test binary is neither.
-		self, err := os.Executable()
-		if err != nil {
-			t.Fatal(err)
-		}
-		b, err := os.ReadFile(self)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(exe, b, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
 	// TestMain turns fakeSessionEnv into "sleep, then exit", so the copy stays
 	// alive carrying the desktop-session flags in its own argv without ever
 	// running a test.
-	cmd := exec.Command(exe, "--output-format", "stream-json", "--verbose")
-	cmd.Dir = workdir
-	cmd.Env = append(os.Environ(), hostSessionEnvVar+"="+hostID, fakeSessionEnv+"=120")
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-	})
+	session := []string{fakeBinary(t, bindir, "claude"), "--output-format", "stream-json", "--verbose"}
+	env := append(os.Environ(), hostSessionEnvVar+"="+hostID, fakeSessionEnv+"=120")
 
-	pid := int32(cmd.Process.Pid)
+	var pid int32
+	if how == byProgram {
+		cmd := exec.Command(session[0], session[1:]...)
+		cmd.Dir = workdir
+		cmd.Env = env
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		})
+		pid = int32(cmd.Process.Pid)
+	} else {
+		pid = startWrapped(t, bindir, workdir, env, session, how == byCrashedApp)
+	}
+
 	p, err := process.NewProcess(pid)
 	if err != nil {
 		t.Fatal(err)
@@ -109,7 +170,98 @@ func realProc(t *testing.T, bindir, workdir, hostID string) procInfo {
 	if !isClaudeSession(cmdline) || !hasStreamJSON(cmdline) {
 		t.Fatalf("spawned process does not look like a desktop session: %v", cmdline)
 	}
-	return procInfo{pid: pid, cmdline: cmdline, createdAt: time.UnixMilli(ms)}
+	return procInfo{proc: p, pid: pid, cmdline: cmdline, createdAt: time.UnixMilli(ms)}
+}
+
+// startWrapped starts session under a fake disclaimer wrapper and returns the
+// session's pid. The test process plays the app, unless crash is set: then a
+// fake app starts the wrapper and exits, and this waits until the wrapper has
+// been re-parented to pid 1, which is what an app crash leaves on Unix.
+func startWrapped(t *testing.T, bindir, workdir string, env, session []string, crash bool) int32 {
+	t.Helper()
+	args := append([]string{fakeBinary(t, filepath.Join(bindir, "Helpers"), "disclaimer"), "--pgroup", "--"}, session...)
+	role := "wrapper"
+	if crash {
+		args = append([]string{fakeBinary(t, bindir, "desktop-app")}, args...)
+		role = "app"
+	}
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Dir = workdir
+	cmd.Env = withRole(env, role)
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var wrapperPID, sessionPID int
+	if _, err := fmt.Fscan(out, &wrapperPID, &sessionPID); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("the fake wrapper did not report its session: %v", err)
+	}
+	t.Cleanup(func() {
+		// Wrapper first: it is alive while it waits on its session, so neither
+		// pid can have been freed and reused by the time it is signalled.
+		for _, pid := range []int{wrapperPID, sessionPID} {
+			if pr, err := os.FindProcess(pid); err == nil {
+				_ = pr.Kill()
+			}
+		}
+		_ = cmd.Wait()
+	})
+	if crash {
+		_ = cmd.Wait() // the fake app exits as soon as the wrapper is started
+		waitReparented(t, int32(wrapperPID))
+	}
+	return int32(sessionPID)
+}
+
+// waitReparented waits until pid 1 has adopted the orphaned wrapper.
+func waitReparented(t *testing.T, pid int32) {
+	t.Helper()
+	p, err := process.NewProcess(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ppid int32
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if ppid, err = p.Ppid(); err == nil && ppid == 1 {
+			return
+		}
+	}
+	// A Linux subreaper adopts orphans before pid 1 does; the janitor then
+	// treats the wrapper's parent as a live app, so no crash orphan exists.
+	t.Skipf("the orphaned wrapper was adopted by pid %d, not pid 1", ppid)
+}
+
+// fakeBinary copies this test binary to dir/name, once. It is a real, unsigned
+// binary: macOS rewrites a shebang script's argv[0] to the interpreter, hiding
+// the name the session filter matches on, and it refuses to show the argv or
+// environment of an Apple-signed binary such as /bin/sh to a non-root reader,
+// which is the very thing under test. This test binary is neither.
+func fakeBinary(t *testing.T, dir, name string) string {
+	t.Helper()
+	exe := filepath.Join(dir, name)
+	if _, err := os.Stat(exe); err == nil {
+		return exe
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe, b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return exe
 }
 
 // writeTranscript creates a transcript NOW, so its birth time is real, and
@@ -187,8 +339,9 @@ func newClaimScenario(t *testing.T) claimScenario {
 }
 
 // run executes one desktop pass and returns which pids it decided to kill.
-// Always dry-run: the processes are real and must survive the test.
-func (s claimScenario) run(t *testing.T, sessionsDir string, idle, before, after time.Duration, procs []procInfo) map[int32]bool {
+// Always dry-run: the processes are real and must survive the test. tweaks
+// adjust the janitor before the pass, e.g. to put back an older claim rule.
+func (s claimScenario) run(t *testing.T, sessionsDir string, idle, before, after time.Duration, procs []procInfo, tweaks ...func(*Janitor)) map[int32]bool {
 	t.Helper()
 	buf := &bytes.Buffer{}
 	j := New(Config{
@@ -199,6 +352,9 @@ func (s claimScenario) run(t *testing.T, sessionsDir string, idle, before, after
 		PairAfter:     after,
 		DryRun:        true,
 	}, buf)
+	for _, tweak := range tweaks {
+		tweak(j)
+	}
 
 	now := time.Now()
 	var res Result
@@ -326,6 +482,9 @@ func TestClaimedSessionIDOnARealProcess(t *testing.T) {
 	)
 	p := realProc(t, s.bindir, s.workdir, hostID)
 	writeSessionRecord(t, s.sessionsDir, hostID, cliID, s.workdir)
+	if !ownedByDesktopApp(p.proc) {
+		t.Fatal("fixture: the session is not under a live app's wrapper")
+	}
 
 	j := New(Config{ProjectsDir: filepath.Dir(s.projectDir), SessionsDir: s.sessionsDir}, &bytes.Buffer{})
 	got, ok := j.claimedSessionID(p)
@@ -341,6 +500,88 @@ func TestClaimedSessionIDOnARealProcess(t *testing.T) {
 	jEmpty := New(Config{ProjectsDir: filepath.Dir(s.projectDir), SessionsDir: s.emptyDir}, &bytes.Buffer{})
 	if _, ok := jEmpty.claimedSessionID(p); ok {
 		t.Error("a claim resolved with no session records present")
+	}
+}
+
+// TestCrashOrphanStillClaims: after an app crash the wrapper survives,
+// re-parented to pid 1, so the app no longer pauses the session under it and
+// only the janitor can collect it. It is still a process the app started, so
+// its id still names its transcript -- here one born before it, out of the
+// window's reach, so a kill can only come through the claim.
+func TestCrashOrphanStillClaims(t *testing.T) {
+	s := newClaimScenario(t)
+	const (
+		hostID = "local_66666666-6666-6666-6666-666666666666"
+		cliID  = "f0f0f0f0-6666-4666-8666-f0f0f0f0f0f0"
+	)
+	const pairBefore = 200 * time.Millisecond
+	writeTranscript(t, s.projectDir, cliID, s.workdir)
+	writeSessionRecord(t, s.sessionsDir, hostID, cliID, s.workdir)
+	time.Sleep(pairBefore + 400*time.Millisecond)
+
+	orphan := startSession(t, s.bindir, s.workdir, hostID, byCrashedApp)
+	if ownedByDesktopApp(orphan.proc) {
+		t.Fatal("fixture: the app still owns the session, so it is no crash orphan")
+	}
+
+	j := New(Config{ProjectsDir: filepath.Dir(s.projectDir), SessionsDir: s.sessionsDir}, &bytes.Buffer{})
+	if got, ok := j.claimedSessionID(orphan); !ok || got != cliID {
+		t.Fatalf("crash orphan claimed (%q, %v), want (%q, true)", got, ok, cliID)
+	}
+
+	const threshold = 900 * time.Millisecond
+	time.Sleep(threshold + 300*time.Millisecond)
+	if killed := s.run(t, s.sessionsDir, threshold, pairBefore, 30*time.Second, []procInfo{orphan}); !killed[orphan.pid] {
+		t.Errorf("the idle crash orphan %d was not collected through its claim", orphan.pid)
+	}
+}
+
+// TestInheritedHostSessionIDClaimsNothing is MEL-534. momo was started from a
+// desktop session, so every agent it launches inherits that session's
+// CLAUDE_CODE_HOST_SESSION_ID. On this Mac a three-minute-old agent named the
+// "duolinguo" session's transcript, untouched for three days, as its own, and
+// the pass printed `would kill` for it. The desktop session's own process was
+// gone, so no second namer made the transcript contested. Only a process the
+// app started may claim through the id; one an ordinary program started goes
+// to the timestamp window, which here finds the transcript it really writes.
+func TestInheritedHostSessionIDClaimsNothing(t *testing.T) {
+	s := newClaimScenario(t)
+	const (
+		hostDesktop = "local_64646464-6464-6464-6464-646464646464"
+		idDesktop   = "15461546-1546-4546-8546-154615461546"
+		idAgent     = "51335133-5133-4133-8133-513351335133"
+	)
+
+	// The desktop session the environment came from: its transcript was born
+	// long before the agent, out of the agent's window, and has gone quiet.
+	const pairBefore = 200 * time.Millisecond
+	writeTranscript(t, s.projectDir, idDesktop, s.workdir)
+	writeSessionRecord(t, s.sessionsDir, hostDesktop, idDesktop, s.workdir)
+	time.Sleep(pairBefore + 400*time.Millisecond)
+
+	agent := startSession(t, s.bindir, s.workdir, hostDesktop, byProgram)
+	agentTr := writeTranscript(t, s.projectDir, idAgent, s.workdir)
+
+	const threshold = 900 * time.Millisecond
+	time.Sleep(threshold + 300*time.Millisecond)
+	touchNow(t, agentTr) // the agent is mid-task
+
+	procs := []procInfo{agent}
+
+	// Before: the id alone was the credential, so the agent was judged on the
+	// inherited transcript.
+	before := s.run(t, s.sessionsDir, threshold, pairBefore, 30*time.Second, procs,
+		func(j *Janitor) { j.claim = j.envSessionID })
+	if !before[agent.pid] {
+		t.Fatalf("the inherited id was expected to condemn the working agent %d, got killed=%v", agent.pid, before)
+	}
+
+	j := New(Config{ProjectsDir: filepath.Dir(s.projectDir), SessionsDir: s.sessionsDir}, &bytes.Buffer{})
+	if id, ok := j.claimedSessionID(agent); ok {
+		t.Errorf("a process an ordinary program started claimed %s through an inherited id", id)
+	}
+	if after := s.run(t, s.sessionsDir, threshold, pairBefore, 30*time.Second, procs); after[agent.pid] {
+		t.Errorf("the working agent %d was killed on a transcript it only inherited the id of", agent.pid)
 	}
 }
 
@@ -399,6 +640,10 @@ func oldTierOne(j *Janitor, bprocs []procInfo, trs []transcriptInfo) map[int32]d
 // mid-task -- the exact thing the ticket exists to stop, re-entering through
 // the fix. Two namers mean the pass cannot tell which owns it, so it must
 // conclude nothing about either.
+//
+// Since MEL-534 an inheritor claims nothing (TestInheritedHostSessionIDClaimsNothing),
+// so here both namers are processes the app started. That was never observed,
+// but nothing rules it out, and the rule costs nothing when it does not happen.
 func TestCoClaimedTranscriptKillsNobody(t *testing.T) {
 	s := newClaimScenario(t)
 	const (
@@ -407,8 +652,7 @@ func TestCoClaimedTranscriptKillsNobody(t *testing.T) {
 		idOwn      = "99999999-9999-4999-8999-999999999999"
 	)
 
-	// Two live sessions carrying one host session id: the desktop session and
-	// the session a program it started launched with the inherited environment.
+	// Two live sessions the app started, carrying one host session id.
 	owner := realProc(t, s.bindir, s.workdir, hostShared)
 	time.Sleep(150 * time.Millisecond)
 	inheritor := realProc(t, s.bindir, s.workdir, hostShared)
